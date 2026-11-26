@@ -22,6 +22,7 @@ interface ParsedFlags {
   home?: string;
   port?: number;
   spoolOnly?: boolean;
+  json?: boolean;
   help: boolean;
   version: boolean;
 }
@@ -32,7 +33,7 @@ function usageText(): string {
     "",
     "Usage:",
     "  corvus install   [--dir PATH] [--mem PATH] [--home PATH] [--port PORT] [--spool-only]",
-    "  corvus status    [--dir PATH] [--mem PATH] [--home PATH] [--port PORT] [--spool-only]",
+    "  corvus status    [--dir PATH] [--mem PATH] [--home PATH] [--port PORT] [--spool-only] [--json]",
     "  corvus uninstall [--dir PATH]",
     "",
     "Options:",
@@ -42,6 +43,7 @@ function usageText(): string {
     "  --home PATH    agent-memory data directory (default: $AGENT_MEMORY_HOME or ~/.agent-memory)",
     "  --port PORT    agent-memory Quack port (default: $AGENT_MEMORY_PORT or 9494)",
     "  --spool-only   write capture records directly to the spool",
+    "  --json         output status as JSON (with `corvus status`)",
     "  -h, --help     show this help and exit",
     "  -v, --version  show version and exit",
   ].join("\n");
@@ -65,6 +67,10 @@ function parseFlags(args: string[]): ParsedFlags {
     }
     if (arg === "--spool-only") {
       flags.spoolOnly = true;
+      continue;
+    }
+    if (arg === "--json") {
+      flags.json = true;
       continue;
     }
     if (arg === "--dir" || arg === "--mem" || arg === "--home" || arg === "--port") {
@@ -155,6 +161,9 @@ export function runCli(
   try {
     switch (command) {
       case "install": {
+        if (flags.json !== undefined) {
+          throw new InstallerError("--json is supported only with status");
+        }
         installExtension(
           {
             dir: flags.dir,
@@ -168,24 +177,26 @@ export function runCli(
         return 0;
       }
       case "status": {
-        const ok = statusExtension(
+        const result = statusExtension(
           {
             dir: flags.dir,
             mem: flags.mem,
             home: flags.home,
             port: flags.port,
             spoolOnly: flags.spoolOnly,
+            json: flags.json,
           },
           io,
         );
-        return ok ? 0 : 1;
+        return result.ok ? 0 : 1;
       }
       case "uninstall": {
         if (
           flags.mem !== undefined ||
           flags.home !== undefined ||
           flags.port !== undefined ||
-          flags.spoolOnly !== undefined
+          flags.spoolOnly !== undefined ||
+          flags.json !== undefined
         ) {
           throw new InstallerError("uninstall accepts only --dir");
         }

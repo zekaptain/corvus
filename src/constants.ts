@@ -8,6 +8,7 @@
 export const CORVUS_VERSION = "0.1.0";
 export const OWNER_MARKER = "corvus";
 export const MANAGED_EXTENSION_DIR_NAME = "corvus";
+export const LEGACY_EXTENSION_DIR_NAME = "agent-memory";
 export const DEFAULT_EXTENSIONS_DIR = "~/.omp/agent/extensions";
 export const EXTENSION_SOURCE_FILES = ["index.ts", "mapper.ts", "sink.ts"] as const;
 export const CONFIG_FILE_NAME = "config.json";
