@@ -242,8 +242,9 @@ export class BridgeClient {
         this.teardownChild(true);
       };
 
+      // Keep the active request timer ref'd so Bun does not drain the event loop while
+      // awaiting an unref'd bridge child; finish() clears it on every completion path.
       const timer = setTimeout(onTimeout, timeoutMs);
-      timer.unref?.();
 
       let cleanupSignal = () => {};
       if (options.signal) {

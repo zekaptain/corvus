@@ -424,4 +424,67 @@ await client.call("status", { harnessSessionId: "sid-unref" }, {});
       // Child may already be gone.
     }
   });
+
+  it("keeps the event loop alive while awaiting a delayed bridge response with no other active handles", () => {
+    const pidFile = join(tempDir, "delayed-bridge.pid");
+    const fakeMem = writeFakeBridgeScript(
+      tempDir,
+      `import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+let buf = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buf += chunk;
+  let idx = buf.indexOf("\\n");
+  while (idx !== -1) {
+    const line = buf.slice(0, idx).trim();
+    buf = buf.slice(idx + 1);
+    if (line) {
+      const req = JSON.parse(line);
+      setTimeout(() => {
+        process.stdout.write(JSON.stringify({ id: req.id, ok: true, result: { delayed: true } }) + "\\n");
+      }, 80);
+    }
+    idx = buf.indexOf("\\n");
+  }
+});
+setTimeout(() => {}, 15000);
+`,
+    );
+
+    const bridgePath = resolve(import.meta.dir, "../src/extension/bridge.ts");
+    const runner = join(tempDir, "run-delayed.ts");
+    writeFileSync(
+      runner,
+      `import assert from "node:assert/strict";
+import { BridgeClient } from ${JSON.stringify(bridgePath)};
+const client = new BridgeClient({ mem: ${JSON.stringify(fakeMem)}, toolTimeoutMs: 2000 }, () => {});
+process.once("beforeExit", () => client.close());
+const res = await client.call("recall", { harnessSessionId: "sid-delayed" }, { query: "q" });
+assert.equal(res.ok, true, JSON.stringify(res));
+if (res.ok) {
+  assert.equal(res.result.delayed, true);
+}
+// No explicit client.close() here; process should still exit promptly once timer clears.
+`,
+    );
+
+    const t0 = Date.now();
+    const proc = Bun.spawnSync([process.execPath, runner], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const elapsed = Date.now() - t0;
+    assert.equal(proc.exitCode, 0, proc.stderr.toString());
+    assert.ok(elapsed >= 70 && elapsed < 2_000, `unexpected elapsed ${elapsed}ms`);
+
+    try {
+      const pid = Number(readFileSync(pidFile, "utf8").trim());
+      if (Number.isInteger(pid) && pid > 0) {
+        process.kill(pid, "SIGTERM");
+      }
+    } catch {
+      // Child may already be gone.
+    }
+  });
 });
