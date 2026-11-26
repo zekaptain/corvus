@@ -16,6 +16,8 @@ export const EXTENSION_SOURCE_FILES = [
   "sink.ts",
   "bridge.ts",
   "tools.ts",
+  "session-start.ts",
+  "commands.ts",
 ] as const;
 export const CONFIG_FILE_NAME = "config.json";
 export const MANIFEST_FILE_NAME = "manifest.json";
@@ -24,3 +26,9 @@ export const MANAGED_FILES = [
   CONFIG_FILE_NAME,
   MANIFEST_FILE_NAME,
 ] as const;
+
+export const DEFAULT_SESSION_START_INJECTION = false;
+export const DEFAULT_SESSION_START_MAX_CHARS = 2400;
+export const DEFAULT_SESSION_START_MAX_ITEMS = 12;
+export const DEFAULT_SESSION_START_TIMEOUT_MS = 1500;
+export const DEFAULT_TOOL_TIMEOUT_MS = 15_000;

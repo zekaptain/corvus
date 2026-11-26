@@ -3,15 +3,23 @@
  *
  * Loaded once by omp; omp invokes the default export once per session (main and each
  * spawned subagent) inside the same process. All sessions share one mapper (state keyed
- * by session id), one `mem records` capture sink, and one `mem bridge` tool client.
+ * by session id), one `mem records` capture sink, one lazily spawned `mem bridge` client,
+ * and one session-start memory injector.
  */
 
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BridgeClient, DEFAULT_TOOL_TIMEOUT_MS } from "./bridge.ts";
+import {
+  type OmpCommandDefinition,
+  type OmpCommandMessage,
+  registerCorvusCommands,
+} from "./commands.ts";
 import { OmpMapper } from "./mapper.ts";
 import type { OmpContext, OmpHookPayload } from "./mapper.ts";
+import { DEFAULT_SESSION_START_CONFIG, SessionStartInjector } from "./session-start.ts";
+import type { SessionStartConfig } from "./session-start.ts";
 import { RecordSink } from "./sink.ts";
 import type { FailureReporter, SinkConfig } from "./sink.ts";
 import { type OmpToolDefinition, registerMemoryTools } from "./tools.ts";
@@ -19,6 +27,8 @@ import { type OmpToolDefinition, registerMemoryTools } from "./tools.ts";
 export interface OmpExtensionAPI {
   on: (event: string, handler: (payload: OmpHookPayload, ctx: OmpContext) => unknown) => void;
   registerTool?: (definition: OmpToolDefinition) => void;
+  registerCommand?: (name: string, definition: OmpCommandDefinition) => void;
+  sendMessage?: (message: OmpCommandMessage) => void;
   pi?: {
     VERSION?: string;
   };
@@ -49,15 +59,25 @@ interface StoredConfig {
   spoolOnly?: unknown;
   toolTimeoutMs?: unknown;
   tool_timeout_ms?: unknown;
+  sessionStartInjection?: unknown;
+  sessionStartMaxChars?: unknown;
+  sessionStartMaxItems?: unknown;
+  sessionStartTimeoutMs?: unknown;
 }
 
-export interface LoadedExtensionConfig extends SinkConfig {
+export interface ExtensionConfig extends SinkConfig {
   toolTimeoutMs?: number;
+  sessionStartInjection?: boolean;
+  sessionStartMaxChars?: number;
+  sessionStartMaxItems?: number;
+  sessionStartTimeoutMs?: number;
 }
+
+export type LoadedExtensionConfig = ExtensionConfig;
 
 export interface ExtensionOptions {
   configPath?: string;
-  config?: LoadedExtensionConfig;
+  config?: ExtensionConfig;
   report?: FailureReporter;
   clock?: () => string;
 }
@@ -79,7 +99,11 @@ function parsePositiveTimeout(raw: unknown): number | undefined {
   return undefined;
 }
 
-function envSinkConfig(): LoadedExtensionConfig {
+function positiveIntOrDefault(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : fallback;
+}
+
+function envExtensionConfig(): ExtensionConfig {
   const portRaw = process.env.AGENT_MEMORY_PORT;
   const portParsed = portRaw ? Number(portRaw) : undefined;
   const toolTimeoutMs = parsePositiveTimeout(process.env.CORVUS_TOOL_TIMEOUT_MS);
@@ -92,11 +116,15 @@ function envSinkConfig(): LoadedExtensionConfig {
         : undefined,
     spoolOnly: process.env.AGENT_MEMORY_SPOOL_ONLY === "1",
     ...(toolTimeoutMs !== undefined ? { toolTimeoutMs } : {}),
+    sessionStartInjection: DEFAULT_SESSION_START_CONFIG.enabled,
+    sessionStartMaxChars: DEFAULT_SESSION_START_CONFIG.maxChars,
+    sessionStartMaxItems: DEFAULT_SESSION_START_CONFIG.maxItems,
+    sessionStartTimeoutMs: DEFAULT_SESSION_START_CONFIG.timeoutMs,
   };
 }
 
-export function loadSinkConfig(configPath: string): {
-  config?: LoadedExtensionConfig;
+export function loadExtensionConfig(configPath: string): {
+  config?: ExtensionConfig;
   error?: string;
 } {
   let raw: string;
@@ -104,7 +132,7 @@ export function loadSinkConfig(configPath: string): {
     raw = readFileSync(configPath, "utf8");
   } catch (err) {
     if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
-      return { config: envSinkConfig() };
+      return { config: envExtensionConfig() };
     }
     return { error: `could not read ${configPath} (${err instanceof Error ? err.message : err})` };
   }
@@ -138,10 +166,30 @@ export function loadSinkConfig(configPath: string): {
       mem,
       home,
       port,
-      spoolOnly: stored.spoolOnly === true || stored.spool_only === true,
+      spoolOnly: stored.spool_only === true || stored.spoolOnly === true,
       ...(toolTimeoutMs !== undefined ? { toolTimeoutMs } : {}),
+      sessionStartInjection:
+        typeof stored.sessionStartInjection === "boolean"
+          ? stored.sessionStartInjection
+          : DEFAULT_SESSION_START_CONFIG.enabled,
+      sessionStartMaxChars: positiveIntOrDefault(
+        stored.sessionStartMaxChars,
+        DEFAULT_SESSION_START_CONFIG.maxChars,
+      ),
+      sessionStartMaxItems: positiveIntOrDefault(
+        stored.sessionStartMaxItems,
+        DEFAULT_SESSION_START_CONFIG.maxItems,
+      ),
+      sessionStartTimeoutMs: positiveIntOrDefault(
+        stored.sessionStartTimeoutMs,
+        DEFAULT_SESSION_START_CONFIG.timeoutMs,
+      ),
     },
   };
+}
+
+export function loadSinkConfig(configPath: string): { config?: ExtensionConfig; error?: string } {
+  return loadExtensionConfig(configPath);
 }
 
 export interface CaptureRuntime {
@@ -150,6 +198,25 @@ export interface CaptureRuntime {
   readonly mapper: OmpMapper;
   readonly sink: RecordSink | null;
   readonly bridge: BridgeClient | null;
+  readonly injector: SessionStartInjector | null;
+}
+
+function toSessionStartConfig(config: ExtensionConfig): SessionStartConfig {
+  return {
+    enabled: config.sessionStartInjection ?? DEFAULT_SESSION_START_CONFIG.enabled,
+    maxChars: positiveIntOrDefault(
+      config.sessionStartMaxChars,
+      DEFAULT_SESSION_START_CONFIG.maxChars,
+    ),
+    maxItems: positiveIntOrDefault(
+      config.sessionStartMaxItems,
+      DEFAULT_SESSION_START_CONFIG.maxItems,
+    ),
+    timeoutMs: positiveIntOrDefault(
+      config.sessionStartTimeoutMs,
+      DEFAULT_SESSION_START_CONFIG.timeoutMs,
+    ),
+  };
 }
 
 export function createRuntime(
@@ -187,22 +254,24 @@ export function createRuntime(
     emitWarning(message);
   };
 
-  let resolvedConfig: LoadedExtensionConfig | undefined;
+  let resolvedConfig: ExtensionConfig | undefined;
   let configError: string | undefined;
   if (options.config) {
     resolvedConfig = options.config;
   } else {
-    const loaded = loadSinkConfig(options.configPath ?? defaultConfigPath());
+    const loaded = loadExtensionConfig(options.configPath ?? defaultConfigPath());
     resolvedConfig = loaded.config;
     configError = loaded.error;
   }
 
   let sink: RecordSink | null = null;
   let bridge: BridgeClient | null = null;
+  let injector: SessionStartInjector | null = null;
   const toolTimeoutMs = resolvedConfig?.toolTimeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS;
 
   if (resolvedConfig) {
     sink = new RecordSink(resolvedConfig, reportSink);
+    const sessionStartCfg = toSessionStartConfig(resolvedConfig);
     bridge = new BridgeClient(
       {
         mem: resolvedConfig.mem,
@@ -212,6 +281,7 @@ export function createRuntime(
       },
       emitWarning,
     );
+    injector = new SessionStartInjector(bridge, sessionStartCfg, emitWarning);
   } else if (configError) {
     reportSink(`corvus: capture disabled; ${configError}`);
   }
@@ -234,6 +304,7 @@ export function createRuntime(
     mapper,
     sink,
     bridge,
+    injector,
     closeNow: () => {
       process.off("beforeExit", onBeforeExit);
       sink?.closeNow();
@@ -250,6 +321,24 @@ export function createRuntime(
         onContext: (ctx) => {
           lastCtx = ctx;
         },
+      });
+
+      registerCorvusCommands(pi, {
+        sink,
+        bridge,
+        injector,
+        disabledReason: configError,
+        onContext: (ctx) => {
+          lastCtx = ctx;
+        },
+      });
+
+      pi.on("before_agent_start", async (_payload, ctx) => {
+        lastCtx = ctx;
+        if (!injector) {
+          return undefined;
+        }
+        return injector.handleBeforeAgentStart(ctx);
       });
 
       for (const eventName of HOOK_EVENTS) {
@@ -273,7 +362,7 @@ export function createRuntime(
             activeInstances = Math.max(0, activeInstances - 1);
             if (activeInstances === 0) {
               sink?.scheduleClose();
-              bridge?.close();
+              bridge?.disconnectIdle();
             }
           }
           // Return undefined so omp never treats this handler as blocking or mutating.

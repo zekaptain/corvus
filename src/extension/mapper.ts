@@ -81,6 +81,7 @@ export interface OmpSessionManager {
   getSessionId?: () => string | undefined;
   getSessionFile?: () => string | undefined;
   getEntries?: () => OmpSessionEntry[];
+  getBranch?: () => OmpSessionEntry[];
   getLeafId?: () => string | null | undefined;
   getHeader?: () => OmpSessionHeader | undefined;
 }
@@ -91,6 +92,7 @@ export interface OmpContext {
   hasUI?: boolean;
   ui?: {
     notify?: (message: string, level?: string) => void;
+    setStatus?: (key: string, text: string) => void;
   };
   agent?: OmpAgentInfo;
   model?: OmpModelInfo;

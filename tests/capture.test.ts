@@ -160,6 +160,16 @@ describe("Architecture constraints", () => {
       const content = readFileSync(file, "utf8");
       assert.equal(/@oh-my-pi\//.test(content), false, `unexpected @oh-my-pi/* import in ${file}`);
     }
+
+    const extFiles = collectTsFiles(join(repoRoot, "src", "extension"));
+    for (const file of extFiles) {
+      const content = readFileSync(file, "utf8");
+      assert.equal(
+        /from\s+["']\.\.\//.test(content),
+        false,
+        `extension file ${file} must stay self-contained without parent imports`,
+      );
+    }
   });
 });
 
@@ -1130,6 +1140,81 @@ setTimeout(() => {}, 20);
     }
   });
 
+  it("respawns mem records for a subsequent session after idle shutdown drain", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "corvus-ext-respawn-"));
+    try {
+      const outPath = join(dir, "captured.jsonl");
+      const countPath = join(dir, "starts.log");
+      const fakeMem = join(dir, "mem");
+      writeFileSync(fakeMem, `#!/bin/sh\necho start >> "${countPath}"\ncat >> "${outPath}"\n`);
+      chmodSync(fakeMem, 0o755);
+
+      const errors: string[] = [];
+      const runtime = createRuntime(
+        {
+          config: { mem: fakeMem, closeDelayMs: 15 },
+          report: (msg) => errors.push(msg),
+          clock: fixedClock(),
+        },
+        "19.2.1",
+      );
+
+      const pi1 = new FakePi();
+      runtime.attach(pi1);
+      const sm1 = new FakeSessionManager("sid-1", "/tmp/1.jsonl");
+      const ctx1 = makeCtx(sm1);
+      pi1.emit("session_start", {}, ctx1);
+      pi1.emit("session_shutdown", {}, ctx1);
+
+      await waitFor(() => {
+        try {
+          const lines = readFileSync(outPath, "utf8").trim().split("\n");
+          return lines.length === 2;
+        } catch {
+          return false;
+        }
+      }, 2000);
+
+      // Give mem records a moment to exit 0 after stdin EOF.
+      await new Promise((resolve) => setTimeout(resolve, 60));
+
+      const pi2 = new FakePi();
+      runtime.attach(pi2);
+      const sm2 = new FakeSessionManager("sid-2", "/tmp/2.jsonl");
+      const ctx2 = makeCtx(sm2);
+      pi2.emit("session_start", {}, ctx2);
+      pi2.emit("session_shutdown", {}, ctx2);
+
+      await waitFor(() => {
+        try {
+          const lines = readFileSync(outPath, "utf8").trim().split("\n");
+          return lines.length === 4;
+        } catch {
+          return false;
+        }
+      }, 2000);
+
+      assert.deepEqual(errors, []);
+      const lines = readFileSync(outPath, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as CaptureRecord);
+      assert.deepEqual(
+        lines.map((r) => [r.harness_session_id, r.kind]),
+        [
+          ["sid-1", "session_start"],
+          ["sid-1", "session_end"],
+          ["sid-2", "session_start"],
+          ["sid-2", "session_end"],
+        ],
+      );
+      assert.equal(readFileSync(countPath, "utf8").trim().split("\n").length, 2);
+      runtime.closeNow();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("registers exactly the expected hook events and formats helpers deterministically", () => {
     assert.ok(HOOK_EVENTS.includes("session_start"));
     assert.ok(HOOK_EVENTS.includes("tool_call"));
@@ -1261,5 +1346,72 @@ setTimeout(() => {}, 20);
     assert.equal(mcpRec.payload?.mcp_server, "other-mcp");
     assert.equal(mcpRec.payload?.extension, undefined);
     assert.equal(mcpRec.payload?.memory_op, undefined);
+  });
+
+  it("never misclassifies corvus-memory custom_message as user_msg even when leafId points to it", () => {
+    const mapper = new OmpMapper({ clock: fixedClock() });
+    const sid = "sid-custom-mem-exclusion";
+    const sm = new FakeSessionManager(sid, "/tmp/exclusion.jsonl");
+    const ctx = makeCtx(sm);
+
+    mapper.handle("session_start", {}, ctx, 1);
+
+    // Per MEM-41: omp appends the user message (`9f7ba2a2`), then before_agent_start appends
+    // the `corvus-memory` custom_message (`f03b2ffc`), so leafId already points to `f03b2ffc`
+    // when `message_end` fires for the user message and for the custom_message.
+    const userMsg = {
+      role: "user",
+      content: [{ type: "text", text: "What do we know about Corvus?" }],
+      attribution: "user",
+      timestamp: 1795575570874,
+    };
+    const injectedCustomMsg = {
+      role: "custom",
+      customType: "corvus-memory",
+      content: "# Active memories\n- [mem-1] (global/fact) Use NDJSON bridge",
+      display: false,
+      attribution: "agent",
+      timestamp: 1795575570880,
+    };
+    sm.push({ type: "message", id: "9f7ba2a2", message: userMsg });
+    sm.push({
+      type: "custom_message",
+      id: "f03b2ffc",
+      customType: "corvus-memory",
+      message: injectedCustomMsg,
+    });
+    assert.equal(sm.getLeafId(), "f03b2ffc");
+
+    const userRecords = mapper.handle("message_end", { message: userMsg }, ctx, 1);
+    assert.equal(userRecords.length, 1);
+    assert.equal(userRecords[0].kind, "user_msg");
+    assert.equal(userRecords[0].source_key, "9f7ba2a2");
+    assert.deepEqual(userRecords[0].attribution, { message_id: "9f7ba2a2" });
+
+    // Even if timestamps differed (forcing Pass 2/3), leafId (`f03b2ffc`) must never be chosen.
+    const userMsg2 = {
+      role: "user",
+      content: "Follow-up prompt",
+      attribution: "user",
+      timestamp: 1795575571000,
+    };
+    sm.push({
+      type: "message",
+      id: "aaaa1111",
+      message: { ...userMsg2, timestamp: 1795575570999 },
+    });
+    sm.push({
+      type: "custom_message",
+      id: "bbbb2222",
+      customType: "corvus-memory",
+      message: { ...injectedCustomMsg, timestamp: 1795575571001 },
+    });
+    assert.equal(sm.getLeafId(), "bbbb2222");
+    const userRecords2 = mapper.handle("message_end", { message: userMsg2 }, ctx, 1);
+    assert.equal(userRecords2[0].source_key, "aaaa1111");
+
+    // `message_end` for `role: "custom"` / `customType: "corvus-memory"` emits zero records.
+    const customRecords = mapper.handle("message_end", { message: injectedCustomMsg }, ctx, 1);
+    assert.deepEqual(customRecords, []);
   });
 });
