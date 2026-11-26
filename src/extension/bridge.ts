@@ -1,29 +1,41 @@
 /**
- * Persistent NDJSON stdio client for `mem bridge`.
+ * Persistent NDJSON stdio client for `agent-memory`'s `mem bridge`.
  *
- * Lazily spawns `<mem> [--home ...] [--port ...] bridge --agent oh-my-pi`, unrefs the child
- * and its stdio streams so idle sessions never block process exit, enforces per-call timeouts
- * and AbortSignals, kills/clears wedged children so future calls can respawn cleanly, and
- * reports failures at most once via the provided warning callback.
+ * Contract:
+ * - Lazily spawns `<mem> [--home <home>] [--port <port>] bridge --agent oh-my-pi` on first call.
+ * - Unrefs the child process and stdio streams so a live bridge never blocks omp exit.
+ * - Serializes NDJSON requests with unique ids and matches NDJSON responses line-by-line.
+ * - Enforces bounded per-call timeouts combined with caller `AbortSignal`.
+ * - Resolves cleanly on timeout, abort, crash, invalid JSON, or missing binary, kills/clears any
+ *   wedged child so the next call can respawn cleanly, and reports transport failures at most once.
  */
 
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import type { FailureReporter } from "./sink.ts";
 
+export const DEFAULT_BRIDGE_AGENT_ID = "oh-my-pi";
+export const DEFAULT_TOOL_TIMEOUT_MS = 15_000;
+
+export type BridgeOp = "recall" | "remember" | "cite" | "review" | "status" | "session_context";
+
 export interface BridgeConfig {
   mem: string;
   home?: string;
   port?: number;
+  agentId?: string;
   agent?: string;
+  toolTimeoutMs?: number;
   defaultTimeoutMs?: number;
 }
 
-export interface BridgeSessionContext {
+export interface BridgeSessionRef {
   harnessSessionId: string;
   cwd?: string;
   project?: string;
 }
+
+export type BridgeSessionContext = BridgeSessionRef;
 
 export interface BridgeCallOptions {
   timeoutMs?: number;
@@ -35,29 +47,31 @@ export interface BridgeErrorPayload {
   message: string;
 }
 
-export type BridgeCallResult<T> =
+export type BridgeError = BridgeErrorPayload;
+
+export type BridgeCallResult<T = Record<string, unknown>> =
   | { ok: true; result: T }
-  | { ok: false; error: BridgeErrorPayload };
+  | { ok: false; error: BridgeErrorPayload; transportFailure?: boolean };
 
 export interface BridgeStatusSnapshot {
   running: boolean;
-  healthy: boolean;
+  pid: number | null;
+  pendingRequests: number;
   pendingCount: number;
+  totalCalls: number;
+  failedCalls: number;
   closed: boolean;
   lastError: string | null;
+  healthy: boolean;
 }
 
 interface PendingRequest {
   id: string;
   op: string;
-  resolve: (result: BridgeCallResult<unknown>) => void;
+  resolve: (result: BridgeCallResult<Record<string, unknown>>) => void;
   timer: ReturnType<typeof setTimeout> | null;
-  abortSignal?: AbortSignal;
-  abortHandler?: () => void;
+  cleanupSignal: () => void;
 }
-
-const DEFAULT_BRIDGE_TIMEOUT_MS = 1_500;
-const DEFAULT_AGENT_ID = "oh-my-pi";
 
 export function buildBridgeArgs(config: BridgeConfig): string[] {
   const args: string[] = [];
@@ -67,7 +81,8 @@ export function buildBridgeArgs(config: BridgeConfig): string[] {
   if (config.port !== undefined) {
     args.push("--port", String(config.port));
   }
-  args.push("bridge", "--agent", config.agent || DEFAULT_AGENT_ID);
+  const agent = config.agentId || config.agent || DEFAULT_BRIDGE_AGENT_ID;
+  args.push("bridge", "--agent", agent);
   return args;
 }
 
@@ -75,78 +90,121 @@ export class BridgeClient {
   private readonly config: BridgeConfig;
   private readonly report: FailureReporter;
   private readonly defaultTimeoutMs: number;
-  private readonly pending = new Map<string, PendingRequest>();
 
   private child: ChildProcess | null = null;
   private closingChild: ChildProcess | null = null;
+  private retiredChildren = new WeakSet<ChildProcess>();
   private stdoutBuffer = "";
   private lastStderr = "";
   private nextRequestId = 0;
+  private pending = new Map<string, PendingRequest>();
+
   private closed = false;
-  private healthy = true;
   private reported = false;
+  private totalCalls = 0;
+  private failedCalls = 0;
   private lastError: string | null = null;
 
   constructor(config: BridgeConfig, report: FailureReporter) {
     this.config = config;
     this.report = report;
-    this.defaultTimeoutMs = config.defaultTimeoutMs ?? DEFAULT_BRIDGE_TIMEOUT_MS;
+    const configuredTimeout = config.toolTimeoutMs ?? config.defaultTimeoutMs;
+    this.defaultTimeoutMs =
+      typeof configuredTimeout === "number" &&
+      Number.isFinite(configuredTimeout) &&
+      configuredTimeout > 0
+        ? configuredTimeout
+        : DEFAULT_TOOL_TIMEOUT_MS;
   }
 
   isHealthy(): boolean {
-    return !this.closed && this.healthy;
+    return !this.closed && this.lastError === null;
   }
 
   statusSnapshot(): BridgeStatusSnapshot {
     return {
       running: this.child !== null,
-      healthy: this.isHealthy(),
+      pid: this.child?.pid ?? null,
+      pendingRequests: this.pending.size,
       pendingCount: this.pending.size,
+      totalCalls: this.totalCalls,
+      failedCalls: this.failedCalls,
       closed: this.closed,
       lastError: this.lastError,
+      healthy: this.isHealthy(),
     };
   }
 
-  async call<T>(
-    op: string,
-    session: BridgeSessionContext,
+  async call<T = Record<string, unknown>>(
+    op: BridgeOp | (string & {}),
+    session: BridgeSessionRef,
     args: Record<string, unknown> = {},
     options: BridgeCallOptions = {},
   ): Promise<BridgeCallResult<T>> {
+    this.totalCalls += 1;
+
     if (this.closed) {
+      this.failedCalls += 1;
       return {
         ok: false,
         error: { code: "closed", message: "mem bridge client is closed" },
+        transportFailure: true,
       };
     }
 
     const harnessSessionId = session.harnessSessionId?.trim();
     if (!harnessSessionId) {
+      this.failedCalls += 1;
       return {
         ok: false,
-        error: { code: "invalid_args", message: "harnessSessionId is required" },
+        error: { code: "invalid_args", message: "harness_session_id is required" },
+        transportFailure: false,
       };
     }
 
     if (options.signal?.aborted) {
+      this.failedCalls += 1;
       return {
         ok: false,
-        error: { code: "aborted", message: "mem bridge call aborted" },
+        error: { code: "aborted", message: abortReasonMessage(options.signal) },
+        transportFailure: true,
       };
     }
 
-    const child = this.ensureChild();
-    if (!child || !child.stdin || child.stdin.destroyed || child.stdin.writableEnded) {
+    if (!this.child) {
+      const startError = this.start();
+      if (startError) {
+        this.failedCalls += 1;
+        return {
+          ok: false,
+          error: { code: "bridge_unavailable", message: startError },
+          transportFailure: true,
+        };
+      }
+    }
+
+    const child = this.child;
+    const stdin = child?.stdin;
+    if (!child || !stdin || stdin.destroyed || stdin.writableEnded) {
+      const message = `mem bridge is unavailable (${this.lastError ?? "stdin not writable"})`;
+      this.failedCalls += 1;
+      this.reportOnce(message);
+      this.teardownChild(true);
       return {
         ok: false,
-        error: {
-          code: "spawn_error",
-          message: this.lastError ?? `could not start ${this.config.mem} bridge`,
-        },
+        error: { code: "bridge_unavailable", message },
+        transportFailure: true,
       };
     }
 
     const id = String(++this.nextRequestId);
+    const timeoutMs =
+      typeof options.timeoutMs === "number" &&
+      Number.isFinite(options.timeoutMs) &&
+      options.timeoutMs > 0
+        ? options.timeoutMs
+        : this.defaultTimeoutMs;
+
     const envelope = {
       id,
       op,
@@ -156,161 +214,213 @@ export class BridgeClient {
       args,
     };
 
-    let line: string;
+    let serialized: string;
     try {
-      line = `${JSON.stringify(envelope)}\n`;
+      serialized = `${JSON.stringify(envelope)}\n`;
     } catch (err) {
+      this.failedCalls += 1;
       return {
         ok: false,
         error: {
           code: "invalid_args",
           message: `could not serialize bridge request (${errorMessage(err)})`,
         },
+        transportFailure: false,
       };
     }
 
-    const timeoutMs = options.timeoutMs ?? this.defaultTimeoutMs;
-
     return new Promise<BridgeCallResult<T>>((resolve) => {
-      const entry: PendingRequest = {
-        id,
-        op,
-        resolve: resolve as (result: BridgeCallResult<unknown>) => void,
-        timer: null,
-        abortSignal: options.signal,
+      let settled = false;
+
+      const finish = (result: BridgeCallResult<Record<string, unknown>>) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        const pendingEntry = this.pending.get(id);
+        this.pending.delete(id);
+        if (pendingEntry?.timer) {
+          clearTimeout(pendingEntry.timer);
+          pendingEntry.timer = null;
+        }
+        pendingEntry?.cleanupSignal();
+        if (result.ok) {
+          this.lastError = null;
+        } else {
+          this.failedCalls += 1;
+        }
+        resolve(result as BridgeCallResult<T>);
       };
 
-      if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
-        entry.timer = setTimeout(() => {
-          if (!this.pending.has(id)) {
-            return;
-          }
-          const detail = `mem bridge ${op} timed out after ${timeoutMs}ms`;
-          this.settlePending(id, {
-            ok: false,
-            error: { code: "timeout", message: detail },
-          });
-          this.killWedgedChild(detail, "timeout");
-        }, timeoutMs);
-      }
+      // Keep the timeout timer ref'd while a call is in flight so hosts with no other active
+      // handles (e.g. `omp -p "/corvus status"`) do not drain the event loop and trigger
+      // `beforeExit` before the bridge responds. `finish()` clears this timer on every outcome,
+      // leaving the idle unref'd child free not to block process exit.
+      const timer = setTimeout(() => {
+        if (settled) {
+          return;
+        }
+        const message = `mem bridge timed out after ${timeoutMs}ms on ${op}`;
+        this.lastError = message;
+        this.reportOnce(message);
+        finish({
+          ok: false,
+          error: { code: "bridge_timeout", message },
+          transportFailure: true,
+        });
+        this.failAllPending("bridge_timeout", message);
+        this.teardownChild(true);
+      }, timeoutMs);
 
+      let cleanupSignal = () => {};
       if (options.signal) {
         const onAbort = () => {
-          if (!this.pending.has(id)) {
+          if (settled) {
             return;
           }
-          this.settlePending(id, {
+          const message = `mem bridge ${op} aborted (${abortReasonMessage(options.signal)})`;
+          this.lastError = message;
+          this.reportOnce(message);
+          finish({
             ok: false,
-            error: { code: "aborted", message: "mem bridge call aborted" },
+            error: { code: "aborted", message },
+            transportFailure: true,
           });
+          this.failAllPending("bridge_unavailable", "mem bridge reset after aborted call");
+          this.teardownChild(true);
         };
-        entry.abortHandler = onAbort;
         options.signal.addEventListener("abort", onAbort, { once: true });
+        cleanupSignal = () => {
+          options.signal?.removeEventListener("abort", onAbort);
+        };
       }
 
-      this.pending.set(id, entry);
+      this.pending.set(id, {
+        id,
+        op,
+        resolve: finish,
+        timer,
+        cleanupSignal,
+      });
 
       try {
-        child.stdin?.write(line, (err) => {
-          if (err && this.pending.has(id)) {
-            const detail = `mem bridge stdin write failed (${errorMessage(err)})`;
-            this.settlePending(id, {
+        stdin.write(serialized, (err) => {
+          if (err && !settled) {
+            const message = `mem bridge pipe failed (${errorMessage(err)})`;
+            this.lastError = message;
+            this.reportOnce(message);
+            finish({
               ok: false,
-              error: { code: "pipe_error", message: detail },
+              error: { code: "bridge_unavailable", message },
+              transportFailure: true,
             });
-            this.killWedgedChild(detail, "pipe_error");
+            this.failAllPending("bridge_unavailable", message);
+            this.teardownChild(true);
           }
         });
       } catch (err) {
-        const detail = `mem bridge stdin write failed (${errorMessage(err)})`;
-        this.settlePending(id, {
-          ok: false,
-          error: { code: "pipe_error", message: detail },
-        });
-        this.killWedgedChild(detail, "pipe_error");
+        if (!settled) {
+          const message = `could not write to mem bridge (${errorMessage(err)})`;
+          this.lastError = message;
+          this.reportOnce(message);
+          finish({
+            ok: false,
+            error: { code: "bridge_unavailable", message },
+            transportFailure: true,
+          });
+          this.failAllPending("bridge_unavailable", message);
+          this.teardownChild(true);
+        }
       }
     });
   }
 
+  /**
+   * Synchronously close the active bridge child process when sessions go idle,
+   * while allowing future sessions to respawn cleanly.
+   */
+  disconnectIdle(): void {
+    const child = this.child;
+    if (!child) {
+      return;
+    }
+    this.closingChild = child;
+    this.failAllPending("bridge_unavailable", "mem bridge closed");
+    this.teardownChild(false);
+  }
+
+  /**
+   * Permanently close this bridge client (safe in `beforeExit` and `closeNow`).
+   */
   close(): void {
     if (this.closed) {
       return;
     }
     this.closed = true;
-    this.settleAllPending("closed", "mem bridge client closed");
-
     const child = this.child;
-    this.child = null;
-    this.stdoutBuffer = "";
     if (!child) {
       return;
     }
     this.closingChild = child;
-    const stdin = child.stdin;
-    if (stdin && !stdin.destroyed && !stdin.writableEnded) {
-      try {
-        stdin.end();
-      } catch {
-        // Ignore pipe errors during shutdown.
-      }
-    }
-    unrefStream(child.stdin);
-    unrefStream(child.stdout);
-    unrefStream(child.stderr);
+    this.failAllPending("closed", "mem bridge client closed");
+    this.teardownChild(false);
   }
 
-  private ensureChild(): ChildProcess | null {
-    if (this.child) {
-      return this.child;
-    }
+  private start(): string | null {
     const args = buildBridgeArgs(this.config);
+    this.stdoutBuffer = "";
+    this.lastStderr = "";
+
     let child: ChildProcess;
     try {
       child = spawn(this.config.mem, args, {
         stdio: ["pipe", "pipe", "pipe"],
       });
     } catch (err) {
-      const detail = `could not start ${this.config.mem} bridge (${errorMessage(err)})`;
-      this.healthy = false;
-      this.lastError = detail;
-      this.warnOnce(detail);
-      return null;
+      const message = `could not start ${this.config.mem} (${errorMessage(err)})`;
+      this.lastError = message;
+      this.reportOnce(message);
+      return message;
     }
 
     this.child = child;
-    this.stdoutBuffer = "";
-    this.lastStderr = "";
     child.unref();
-    unrefStream(child.stdin);
-    unrefStream(child.stdout);
-    unrefStream(child.stderr);
 
-    child.stdin?.on("error", (err) => {
-      if (this.child !== child || this.closed || this.closingChild === child) {
-        return;
-      }
-      this.killWedgedChild(`mem bridge pipe failed (${errorMessage(err)})`, "pipe_error");
-    });
+    const stdin = child.stdin;
+    if (stdin) {
+      unrefStream(stdin);
+      stdin.on("error", (err) => {
+        if (this.closingChild === child || this.child !== child) {
+          return;
+        }
+        const message = `mem bridge pipe failed (${errorMessage(err)})`;
+        this.lastError = message;
+        this.reportOnce(message);
+        this.failAllPending("bridge_unavailable", message);
+        this.teardownChild(true);
+      });
+    }
 
-    if (child.stdout) {
-      child.stdout.setEncoding("utf8");
-      child.stdout.on("data", (chunk: string) => {
+    const stdout = child.stdout;
+    if (stdout) {
+      stdout.setEncoding("utf8");
+      unrefStream(stdout);
+      stdout.on("data", (chunk: string) => {
         if (this.child !== child) {
           return;
         }
         this.handleStdoutChunk(chunk);
       });
-      child.stdout.on("error", (err) => {
-        if (this.child !== child || this.closed || this.closingChild === child) {
-          return;
-        }
-        this.killWedgedChild(`mem bridge stdout failed (${errorMessage(err)})`, "pipe_error");
+      stdout.on("error", () => {
+        // Ignore stdout stream errors during teardown.
       });
     }
 
-    if (child.stderr) {
-      child.stderr.setEncoding("utf8");
-      child.stderr.on("data", (chunk: string) => {
+    const stderr = child.stderr;
+    if (stderr) {
+      stderr.setEncoding("utf8");
+      unrefStream(stderr);
+      stderr.on("data", (chunk: string) => {
         if (this.child !== child) {
           return;
         }
@@ -322,48 +432,56 @@ export class BridgeClient {
           this.lastStderr = lines[lines.length - 1];
         }
       });
-      child.stderr.on("error", () => {
+      stderr.on("error", () => {
         // Ignore stderr pipe errors.
       });
     }
 
     child.on("error", (err) => {
-      if (this.child !== child) {
+      if (this.closingChild === child || this.retiredChildren.has(child)) {
         return;
       }
-      const detail = `could not start ${this.config.mem} bridge (${errorMessage(err)})`;
-      this.handleUnexpectedChildStop(child, "spawn_error", detail);
+      const message = `could not start ${this.config.mem} (${errorMessage(err)})`;
+      this.lastError = message;
+      this.reportOnce(message);
+      if (this.child === child) {
+        this.failAllPending("bridge_unavailable", message);
+        this.teardownChild(true);
+      }
     });
 
     child.on("close", (code, signal) => {
-      if (this.closingChild === child) {
+      const wasClosing = this.closingChild === child;
+      const wasRetired = this.retiredChildren.has(child);
+      if (wasClosing) {
         this.closingChild = null;
+      }
+      if (this.child === child) {
+        this.child = null;
+        this.stdoutBuffer = "";
+      }
+      if (wasRetired || (wasClosing && (code === 0 || code === null))) {
         return;
       }
-      if (this.child !== child) {
-        return;
-      }
-      const reason = signal ? `signal ${signal}` : `exit code ${code ?? "unknown"}`;
+      const detail = signal ? `signal ${signal}` : `exit code ${code ?? "unknown"}`;
       const extra = this.lastStderr ? `: ${this.lastStderr}` : "";
-      this.handleUnexpectedChildStop(
-        child,
-        "process_exit",
-        `mem bridge stopped (${reason})${extra}`,
-      );
+      const message = `mem bridge stopped (${detail})${extra}`;
+      this.lastError = message;
+      this.reportOnce(message);
+      this.failAllPending("bridge_unavailable", message);
     });
 
-    return child;
+    return null;
   }
 
   private handleStdoutChunk(chunk: string): void {
     this.stdoutBuffer += chunk;
     let newlineIndex = this.stdoutBuffer.indexOf("\n");
     while (newlineIndex !== -1) {
-      const rawLine = this.stdoutBuffer.slice(0, newlineIndex).replace(/\r$/, "");
+      const line = this.stdoutBuffer.slice(0, newlineIndex).trim();
       this.stdoutBuffer = this.stdoutBuffer.slice(newlineIndex + 1);
-      const trimmed = rawLine.trim();
-      if (trimmed) {
-        this.handleResponseLine(trimmed);
+      if (line) {
+        this.handleStdoutLine(line);
         if (!this.child) {
           return;
         }
@@ -372,45 +490,43 @@ export class BridgeClient {
     }
   }
 
-  private handleResponseLine(line: string): void {
+  private handleStdoutLine(line: string): void {
     let parsed: unknown;
     try {
       parsed = JSON.parse(line);
     } catch (err) {
-      this.killWedgedChild(
-        `mem bridge emitted invalid JSON (${errorMessage(err)})`,
-        "protocol_error",
-      );
+      const message = `mem bridge emitted invalid JSON (${errorMessage(err)})`;
+      this.lastError = message;
+      this.reportOnce(message);
+      this.failAllPending("protocol_error", message);
+      this.teardownChild(true);
       return;
     }
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      this.killWedgedChild("mem bridge emitted non-object JSON response", "protocol_error");
+      const message = "mem bridge emitted non-object JSON response";
+      this.lastError = message;
+      this.reportOnce(message);
+      this.failAllPending("protocol_error", message);
+      this.teardownChild(true);
       return;
     }
-    const obj = parsed as {
-      id?: unknown;
-      ok?: unknown;
-      result?: unknown;
-      error?: unknown;
-    };
-
-    if (obj.id === undefined || obj.id === null) {
+    const obj = parsed as Record<string, unknown>;
+    const rawId = obj.id;
+    if (rawId === null || rawId === undefined) {
       return;
     }
-
-    const id = String(obj.id);
-    if (!this.pending.has(id)) {
+    const id = String(rawId);
+    const entry = this.pending.get(id);
+    if (!entry) {
       return;
     }
-
-    this.healthy = true;
-    this.lastError = null;
 
     if (obj.ok === true) {
-      this.settlePending(id, {
-        ok: true,
-        result: obj.result,
-      });
+      const result =
+        obj.result && typeof obj.result === "object" && !Array.isArray(obj.result)
+          ? (obj.result as Record<string, unknown>)
+          : {};
+      entry.resolve({ ok: true, result });
       return;
     }
 
@@ -418,94 +534,72 @@ export class BridgeClient {
       obj.error && typeof obj.error === "object" && !Array.isArray(obj.error)
         ? (obj.error as Record<string, unknown>)
         : {};
-    const code = typeof errObj.code === "string" && errObj.code ? errObj.code : "bridge_error";
+    const code = typeof errObj.code === "string" && errObj.code ? errObj.code : "internal_error";
     const message =
-      typeof errObj.message === "string" && errObj.message
-        ? errObj.message
-        : "mem bridge returned an error";
-    this.settlePending(id, {
+      typeof errObj.message === "string" && errObj.message ? errObj.message : "bridge error";
+    entry.resolve({
       ok: false,
       error: { code, message },
+      transportFailure: false,
     });
   }
 
-  private handleUnexpectedChildStop(child: ChildProcess, code: string, detail: string): void {
-    if (this.child === child) {
-      this.child = null;
-      this.stdoutBuffer = "";
-    }
-    if (this.closed) {
-      return;
-    }
-    this.healthy = false;
-    this.lastError = detail;
-    this.warnOnce(detail);
-    this.settleAllPending(code, detail);
-  }
-
-  private killWedgedChild(detail: string, code: string): void {
-    this.healthy = false;
-    this.lastError = detail;
-    this.warnOnce(detail);
-
-    const child = this.child;
-    this.child = null;
-    this.stdoutBuffer = "";
-    this.settleAllPending(code, detail);
-
-    if (!child) {
-      return;
-    }
-    this.closingChild = child;
-    try {
-      child.stdin?.destroy();
-    } catch {
-      // Ignore.
-    }
-    try {
-      child.stdout?.destroy();
-    } catch {
-      // Ignore.
-    }
-    try {
-      child.stderr?.destroy();
-    } catch {
-      // Ignore.
-    }
-    try {
-      child.kill("SIGKILL");
-    } catch {
-      // Ignore already exited child.
-    }
-  }
-
-  private settlePending(id: string, result: BridgeCallResult<unknown>): void {
-    const entry = this.pending.get(id);
-    if (!entry) {
-      return;
-    }
-    this.pending.delete(id);
-    if (entry.timer) {
-      clearTimeout(entry.timer);
-      entry.timer = null;
-    }
-    if (entry.abortSignal && entry.abortHandler) {
-      entry.abortSignal.removeEventListener("abort", entry.abortHandler);
-      entry.abortHandler = undefined;
-    }
-    entry.resolve(result);
-  }
-
-  private settleAllPending(code: string, message: string): void {
-    for (const id of [...this.pending.keys()]) {
-      this.settlePending(id, {
+  private failAllPending(code: string, message: string): void {
+    const entries = [...this.pending.values()];
+    for (const entry of entries) {
+      entry.resolve({
         ok: false,
         error: { code, message },
+        transportFailure: true,
       });
     }
   }
 
-  private warnOnce(detail: string): void {
+  private teardownChild(forceKill: boolean): void {
+    const child = this.child;
+    this.child = null;
+    this.stdoutBuffer = "";
+    if (!child) {
+      return;
+    }
+    if (forceKill) {
+      this.retiredChildren.add(child);
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // Ignore if already exited.
+      }
+      try {
+        child.stdin?.destroy();
+      } catch {
+        // Ignore.
+      }
+      try {
+        child.stdout?.destroy();
+      } catch {
+        // Ignore.
+      }
+      try {
+        child.stderr?.destroy();
+      } catch {
+        // Ignore.
+      }
+      return;
+    }
+    try {
+      const stdin = child.stdin;
+      if (stdin && !stdin.destroyed && !stdin.writableEnded) {
+        stdin.end();
+      }
+    } catch {
+      // Ignore pipe errors during clean shutdown.
+    }
+    unrefStream(child.stdin);
+    unrefStream(child.stdout);
+    unrefStream(child.stderr);
+  }
+
+  private reportOnce(detail: string): void {
     if (this.reported) {
       return;
     }
@@ -513,9 +607,20 @@ export class BridgeClient {
     try {
       this.report(`corvus: ${detail}`);
     } catch {
-      // Never let warning reporting crash omp.
+      // Never let failure reporting crash omp.
     }
   }
+}
+
+function abortReasonMessage(signal: AbortSignal | undefined): string {
+  const reason = signal?.reason;
+  if (reason instanceof Error) {
+    return reason.message;
+  }
+  if (typeof reason === "string" && reason.trim()) {
+    return reason;
+  }
+  return "request aborted";
 }
 
 function unrefStream(stream: unknown): void {

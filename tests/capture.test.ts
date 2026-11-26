@@ -20,6 +20,7 @@ import {
 } from "../src/extension/index.ts";
 import {
   AGENT_ID,
+  CORVUS_NATIVE_TOOLS,
   type CaptureRecord,
   type OmpAgentInfo,
   type OmpContext,
@@ -1139,6 +1140,81 @@ setTimeout(() => {}, 20);
     }
   });
 
+  it("respawns mem records for a subsequent session after idle shutdown drain", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "corvus-ext-respawn-"));
+    try {
+      const outPath = join(dir, "captured.jsonl");
+      const countPath = join(dir, "starts.log");
+      const fakeMem = join(dir, "mem");
+      writeFileSync(fakeMem, `#!/bin/sh\necho start >> "${countPath}"\ncat >> "${outPath}"\n`);
+      chmodSync(fakeMem, 0o755);
+
+      const errors: string[] = [];
+      const runtime = createRuntime(
+        {
+          config: { mem: fakeMem, closeDelayMs: 15 },
+          report: (msg) => errors.push(msg),
+          clock: fixedClock(),
+        },
+        "19.2.1",
+      );
+
+      const pi1 = new FakePi();
+      runtime.attach(pi1);
+      const sm1 = new FakeSessionManager("sid-1", "/tmp/1.jsonl");
+      const ctx1 = makeCtx(sm1);
+      pi1.emit("session_start", {}, ctx1);
+      pi1.emit("session_shutdown", {}, ctx1);
+
+      await waitFor(() => {
+        try {
+          const lines = readFileSync(outPath, "utf8").trim().split("\n");
+          return lines.length === 2;
+        } catch {
+          return false;
+        }
+      }, 2000);
+
+      // Give mem records a moment to exit 0 after stdin EOF.
+      await new Promise((resolve) => setTimeout(resolve, 60));
+
+      const pi2 = new FakePi();
+      runtime.attach(pi2);
+      const sm2 = new FakeSessionManager("sid-2", "/tmp/2.jsonl");
+      const ctx2 = makeCtx(sm2);
+      pi2.emit("session_start", {}, ctx2);
+      pi2.emit("session_shutdown", {}, ctx2);
+
+      await waitFor(() => {
+        try {
+          const lines = readFileSync(outPath, "utf8").trim().split("\n");
+          return lines.length === 4;
+        } catch {
+          return false;
+        }
+      }, 2000);
+
+      assert.deepEqual(errors, []);
+      const lines = readFileSync(outPath, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as CaptureRecord);
+      assert.deepEqual(
+        lines.map((r) => [r.harness_session_id, r.kind]),
+        [
+          ["sid-1", "session_start"],
+          ["sid-1", "session_end"],
+          ["sid-2", "session_start"],
+          ["sid-2", "session_end"],
+        ],
+      );
+      assert.equal(readFileSync(countPath, "utf8").trim().split("\n").length, 2);
+      runtime.closeNow();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("registers exactly the expected hook events and formats helpers deterministically", () => {
     assert.ok(HOOK_EVENTS.includes("session_start"));
     assert.ok(HOOK_EVENTS.includes("tool_call"));
@@ -1154,6 +1230,122 @@ setTimeout(() => {}, 20);
       ]),
       { text: "a", hasToolCalls: false, nonTextTypes: ["image"] },
     );
+  });
+
+  it("tags Corvus native memory tool calls and results with extension and memory_op without tagging generic or MCP tools", () => {
+    const mapper = new OmpMapper({ harnessVersion: "19.2.1", clock: fixedClock() });
+    const sid = "01a210a3-b133-705e-b720-09908b69e222";
+    const sm = new FakeSessionManager(sid, `/tmp/sessions/${sid}.jsonl`);
+    const ctx = makeCtx(sm);
+
+    const records: CaptureRecord[] = [];
+    records.push(...mapper.handle("session_start", { type: "session_start" }, ctx, 1));
+
+    for (const toolName of CORVUS_NATIVE_TOOLS) {
+      const toolCallId = `call_${toolName}`;
+      records.push(
+        ...mapper.handle(
+          "tool_call",
+          {
+            type: "tool_call",
+            toolName,
+            toolCallId,
+            input: toolName === "recall" ? { query: "adr" } : {},
+          },
+          ctx,
+          1,
+        ),
+      );
+      const toolMsg = {
+        role: "toolResult",
+        toolCallId,
+        toolName,
+        content: [{ type: "text", text: JSON.stringify({ ok: true, op: toolName }) }],
+        details: { ok: true, op: toolName },
+        isError: false,
+        timestamp: 1795575574000,
+      };
+      sm.push({ type: "message", id: `msg_${toolName}`, message: toolMsg });
+      records.push(
+        ...mapper.handle("message_end", { type: "message_end", message: toolMsg }, ctx, 1),
+      );
+    }
+
+    // Generic built-in tools must NOT receive extension/memory_op tags.
+    for (const nonCorvus of ["bash", "read"]) {
+      const toolCallId = `call_${nonCorvus}`;
+      records.push(
+        ...mapper.handle(
+          "tool_call",
+          { type: "tool_call", toolName: nonCorvus, toolCallId, input: {} },
+          ctx,
+          1,
+        ),
+      );
+      const toolMsg = {
+        role: "toolResult",
+        toolCallId,
+        toolName: nonCorvus,
+        content: [{ type: "text", text: "ok" }],
+        isError: false,
+        timestamp: 1795575575000,
+      };
+      sm.push({ type: "message", id: `msg_${nonCorvus}`, message: toolMsg });
+      records.push(
+        ...mapper.handle("message_end", { type: "message_end", message: toolMsg }, ctx, 1),
+      );
+    }
+
+    // An MCP tool result carrying serverName must NOT be misclassified as Corvus native.
+    const mcpMsg = {
+      role: "toolResult",
+      toolCallId: "call_mcp_recall",
+      toolName: "recall",
+      content: [{ type: "text", text: "{}" }],
+      details: { serverName: "other-mcp", mcpToolName: "recall" },
+      isError: false,
+      timestamp: 1795575576000,
+    };
+    sm.push({ type: "message", id: "msg_mcp_recall", message: mcpMsg });
+    records.push(...mapper.handle("message_end", { type: "message_end", message: mcpMsg }, ctx, 1));
+
+    for (const toolName of ["recall", "remember", "cite", "review", "status"]) {
+      const callRec = records.find(
+        (r) => r.kind === "tool_call" && r.source_key === `call_${toolName}`,
+      );
+      const resRec = records.find(
+        (r) => r.kind === "tool_result" && r.source_key === `call_${toolName}`,
+      );
+      assert.ok(callRec, `missing tool_call for ${toolName}`);
+      assert.ok(resRec, `missing tool_result for ${toolName}`);
+      assert.equal(callRec.payload?.extension, "corvus");
+      assert.equal(callRec.payload?.memory_op, toolName);
+      assert.equal(resRec.payload?.extension, "corvus");
+      assert.equal(resRec.payload?.memory_op, toolName);
+    }
+
+    for (const nonCorvus of ["bash", "read"]) {
+      const callRec = records.find(
+        (r) => r.kind === "tool_call" && r.source_key === `call_${nonCorvus}`,
+      );
+      const resRec = records.find(
+        (r) => r.kind === "tool_result" && r.source_key === `call_${nonCorvus}`,
+      );
+      assert.ok(callRec);
+      assert.ok(resRec);
+      assert.equal(callRec.payload?.extension, undefined);
+      assert.equal(callRec.payload?.memory_op, undefined);
+      assert.equal(resRec.payload?.extension, undefined);
+      assert.equal(resRec.payload?.memory_op, undefined);
+    }
+
+    const mcpRec = records.find(
+      (r) => r.kind === "tool_result" && r.source_key === "call_mcp_recall",
+    );
+    assert.ok(mcpRec);
+    assert.equal(mcpRec.payload?.mcp_server, "other-mcp");
+    assert.equal(mcpRec.payload?.extension, undefined);
+    assert.equal(mcpRec.payload?.memory_op, undefined);
   });
 
   it("never misclassifies corvus-memory custom_message as user_msg even when leafId points to it", () => {

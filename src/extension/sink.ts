@@ -29,6 +29,16 @@ export interface SinkConfig {
 
 export type FailureReporter = (message: string) => void;
 
+export interface SinkStatusSnapshot {
+  alive: boolean;
+  started: boolean;
+  disabled: boolean;
+  spoolOnly: boolean;
+  inFlightBytes: number;
+  lastError: string | null;
+  failed: boolean;
+}
+
 const DEFAULT_STALL_TIMEOUT_MS = 2_000;
 const DEFAULT_MAX_BUFFERED_BYTES = 512 * 1024;
 const DEFAULT_CLOSE_DELAY_MS = 50;
@@ -56,13 +66,17 @@ export class RecordSink {
   private readonly closeDelayMs: number;
 
   private child: ChildProcess | null = null;
+  private closingChildren = new WeakSet<ChildProcess>();
   private started = false;
   private closing = false;
+  private idleClosed = false;
+  private permanentlyClosed = false;
   private closeScheduled = false;
   private failed = false;
   private reported = false;
   private pendingBytes = 0;
   private lastStderr = "";
+  private lastError: string | null = null;
   private stallTimer: ReturnType<typeof setTimeout> | null = null;
   private closeTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -82,22 +96,42 @@ export class RecordSink {
     return this.pendingBytes;
   }
 
+  statusSnapshot(): SinkStatusSnapshot {
+    return {
+      alive: this.child !== null && !this.failed && !this.closing,
+      started: this.started,
+      disabled: this.failed || this.permanentlyClosed,
+      spoolOnly: Boolean(this.config.spoolOnly),
+      inFlightBytes: this.pendingBytes,
+      lastError: this.lastError,
+      failed: this.failed,
+    };
+  }
+
   /**
    * Queue one capture record for `mem records`. Always returns synchronously.
    */
   write(record: CaptureRecord): void {
-    if (this.failed || this.closing) {
+    if (this.failed || this.permanentlyClosed) {
       return;
     }
     const wasClosingSoon = this.closeScheduled;
     if (wasClosingSoon) {
       this.cancelScheduledClose();
     }
+    if (this.idleClosed) {
+      this.started = false;
+      this.closing = false;
+      this.idleClosed = false;
+      this.child = null;
+      this.pendingBytes = 0;
+    }
     if (!this.started) {
       this.start();
     }
-    const stdin = this.child?.stdin;
-    if (this.failed || !stdin || stdin.destroyed || stdin.writableEnded) {
+    const child = this.child;
+    const stdin = child?.stdin;
+    if (this.failed || !child || !stdin || stdin.destroyed || stdin.writableEnded) {
       return;
     }
 
@@ -119,11 +153,13 @@ export class RecordSink {
     this.pendingBytes += bytes;
     try {
       const ok = stdin.write(line, (err) => {
-        this.pendingBytes = Math.max(0, this.pendingBytes - bytes);
-        if (this.pendingBytes === 0) {
-          this.clearStallTimer();
+        if (this.child === child) {
+          this.pendingBytes = Math.max(0, this.pendingBytes - bytes);
+          if (this.pendingBytes === 0) {
+            this.clearStallTimer();
+          }
         }
-        if (err && !this.closing && !this.failed) {
+        if (err && !this.closingChildren.has(child) && !this.closing && !this.failed) {
           this.failOnce(`mem records pipe failed (${errorMessage(err)})`);
           this.teardownChild();
         }
@@ -149,27 +185,24 @@ export class RecordSink {
    * still make it into the pipe. Safe to call repeatedly.
    */
   scheduleClose(): void {
-    if (!this.started || this.failed || this.closing) {
+    if (!this.started || this.failed || this.closing || this.permanentlyClosed) {
       return;
     }
     this.cancelScheduledClose();
     this.closeScheduled = true;
     if (this.closeDelayMs <= 0) {
-      this.closeNow();
+      this.closeIdle();
       return;
     }
     this.closeTimer = setTimeout(() => {
       this.closeTimer = null;
       this.closeScheduled = false;
-      this.closeNow();
+      this.closeIdle();
     }, this.closeDelayMs);
     this.closeTimer.unref?.();
   }
 
-  /**
-   * End stdin immediately so `mem records` flushes its last pass and exits cleanly.
-   */
-  closeNow(): void {
+  private closeIdle(): void {
     this.cancelScheduledClose();
     this.closeScheduled = false;
     this.clearStallTimer();
@@ -177,7 +210,32 @@ export class RecordSink {
       return;
     }
     this.closing = true;
-    const stdin = this.child?.stdin;
+    this.idleClosed = true;
+    this.endChildStdin();
+  }
+
+  /**
+   * End stdin immediately and permanently so `mem records` flushes its last pass and exits cleanly.
+   */
+  closeNow(): void {
+    this.cancelScheduledClose();
+    this.closeScheduled = false;
+    this.clearStallTimer();
+    this.permanentlyClosed = true;
+    if (!this.started || this.closing) {
+      return;
+    }
+    this.closing = true;
+    this.endChildStdin();
+  }
+
+  private endChildStdin(): void {
+    const child = this.child;
+    if (!child) {
+      return;
+    }
+    this.closingChildren.add(child);
+    const stdin = child.stdin;
     if (stdin && !stdin.destroyed && !stdin.writableEnded) {
       try {
         stdin.end();
@@ -190,6 +248,7 @@ export class RecordSink {
   private start(): void {
     this.started = true;
     this.closing = false;
+    this.idleClosed = false;
     const args = buildMemArgs(this.config);
 
     let child: ChildProcess;
@@ -208,10 +267,12 @@ export class RecordSink {
     const stdin = child.stdin;
     if (stdin) {
       stdin.on("drain", () => {
-        this.clearStallTimer();
+        if (this.child === child) {
+          this.clearStallTimer();
+        }
       });
       stdin.on("error", (err) => {
-        if (this.closing) {
+        if (this.closingChildren.has(child) || this.child !== child) {
           return;
         }
         this.failOnce(`mem records pipe failed (${errorMessage(err)})`);
@@ -223,6 +284,9 @@ export class RecordSink {
     if (stderr) {
       stderr.setEncoding("utf8");
       stderr.on("data", (chunk: string) => {
+        if (this.child !== child) {
+          return;
+        }
         const lines = chunk
           .split(/\r?\n/)
           .map((line) => line.trim())
@@ -238,25 +302,34 @@ export class RecordSink {
     }
 
     child.on("error", (err) => {
+      if (this.closingChildren.has(child) || this.child !== child) {
+        return;
+      }
       this.failOnce(`could not start ${this.config.mem} (${errorMessage(err)})`);
       this.teardownChild();
     });
 
     child.on("exit", (code, signal) => {
-      this.clearStallTimer();
-      this.child = null;
-      if (!this.closing || (code !== null && code !== 0) || signal !== null) {
+      const wasClosing = this.closingChildren.has(child);
+      if (this.child === child) {
+        this.clearStallTimer();
+        this.child = null;
+      }
+      if (!wasClosing || (code !== null && code !== 0) || signal !== null) {
         this.failed = true;
       }
     });
 
     child.on("close", (code, signal) => {
-      this.clearStallTimer();
-      this.child = null;
-      if (this.closing && code === 0) {
+      const wasClosing = this.closingChildren.has(child);
+      if (this.child === child) {
+        this.clearStallTimer();
+        this.child = null;
+      }
+      if (wasClosing && code === 0) {
         return;
       }
-      if (!this.closing || (code !== null && code !== 0) || signal !== null) {
+      if (!wasClosing || (code !== null && code !== 0) || signal !== null) {
         const detail = signal ? `signal ${signal}` : `exit code ${code ?? "unknown"}`;
         const extra = this.lastStderr ? `: ${this.lastStderr}` : "";
         this.failOnce(`mem records stopped (${detail})${extra}`);
@@ -316,6 +389,7 @@ export class RecordSink {
 
   private failOnce(detail: string): void {
     this.failed = true;
+    this.lastError = detail;
     if (this.reported) {
       return;
     }

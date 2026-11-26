@@ -341,7 +341,7 @@ if (mode === "hang") {
     const elapsed = Date.now() - t0;
     assert.equal(res1.ok, false);
     if (!res1.ok) {
-      assert.equal(res1.error.code, "timeout");
+      assert.equal(res1.error.code, "bridge_timeout");
     }
     assert.ok(elapsed < 1000, `expected timeout promptly, took ${elapsed}ms`);
     assert.equal(warnings.length, 1);

@@ -20,6 +20,7 @@ import { installExtension, sha256Hex, statusExtension } from "../src/cli/install
 import {
   CONFIG_FILE_NAME,
   CORVUS_VERSION,
+  EXTENSION_SOURCE_FILES,
   LEGACY_EXTENSION_DIR_NAME,
   MANAGED_EXTENSION_DIR_NAME,
   MANAGED_FILES,
@@ -112,14 +113,7 @@ describe("corvus installer CLI", () => {
     };
     assert.equal(manifest.managed_by, OWNER_MARKER);
     assert.equal(manifest.version, CORVUS_VERSION);
-    for (const file of [
-      "index.ts",
-      "mapper.ts",
-      "sink.ts",
-      "bridge.ts",
-      "session-start.ts",
-      CONFIG_FILE_NAME,
-    ]) {
+    for (const file of [...EXTENSION_SOURCE_FILES, CONFIG_FILE_NAME]) {
       assert.equal(manifest.files[file], sha256Hex(readFileSync(join(target, file))));
     }
 
@@ -136,14 +130,7 @@ describe("corvus installer CLI", () => {
       "9555",
     ]);
     assert.equal(st1.code, 0, st1.stdout);
-    for (const file of [
-      "index.ts",
-      "mapper.ts",
-      "sink.ts",
-      "bridge.ts",
-      "session-start.ts",
-      CONFIG_FILE_NAME,
-    ]) {
+    for (const file of [...EXTENSION_SOURCE_FILES, CONFIG_FILE_NAME]) {
       assert.match(st1.stdout, new RegExp(`${file}\\s+installed`));
     }
     assert.match(

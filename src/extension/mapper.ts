@@ -7,6 +7,7 @@
 
 export const AGENT_ID = "oh-my-pi";
 export const RECORD_VERSION = 1;
+export const CORVUS_NATIVE_TOOLS = new Set(["recall", "remember", "cite", "review", "status"]);
 
 export type EventKind =
   | "session_start"
@@ -91,6 +92,7 @@ export interface OmpContext {
   hasUI?: boolean;
   ui?: {
     notify?: (message: string, level?: string) => void;
+    setStatus?: (key: string, text: string) => void;
   };
   agent?: OmpAgentInfo;
   model?: OmpModelInfo;
@@ -550,6 +552,7 @@ export class OmpMapper {
           return [];
         }
         const ts = this.clock();
+        const isCorvusTool = Boolean(p.toolName && CORVUS_NATIVE_TOOLS.has(p.toolName));
         return [
           this.record(hsid, "tool_call", p.toolCallId, ts, c, state, {
             role: "assistant",
@@ -560,6 +563,8 @@ export class OmpMapper {
               compactObject({
                 tool_name: p.toolName,
                 tool_input: p.input,
+                extension: isCorvusTool ? "corvus" : undefined,
+                memory_op: isCorvusTool ? p.toolName : undefined,
               }),
             ),
           }),
@@ -706,6 +711,9 @@ export class OmpMapper {
       details && typeof details.serverName === "string" ? details.serverName : undefined;
     const mcpToolName =
       details && typeof details.mcpToolName === "string" ? details.mcpToolName : undefined;
+    const isCorvusTool = Boolean(
+      msg.toolName && CORVUS_NATIVE_TOOLS.has(msg.toolName) && !mcpServer,
+    );
 
     return [
       this.record(hsid, "tool_result", toolCallId, ts, ctx, state, {
@@ -721,6 +729,8 @@ export class OmpMapper {
             is_error: Boolean(msg.isError),
             mcp_server: mcpServer,
             mcp_tool_name: mcpToolName,
+            extension: isCorvusTool ? "corvus" : undefined,
+            memory_op: isCorvusTool ? msg.toolName : undefined,
             message_id: entryId,
           }),
         ),
