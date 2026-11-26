@@ -197,11 +197,26 @@ function getSessionId(ctx: OmpContext | undefined): string | undefined {
   return undefined;
 }
 
+export interface SessionStartStatusSnapshot {
+  enabled: boolean;
+  source: "override" | "env" | "config";
+  maxChars: number;
+  maxItems: number;
+  timeoutMs: number;
+  injectedInCurrentSession: boolean;
+  configuredEnabled: boolean;
+  envOverride: boolean | null;
+  sessionOverride: boolean | null;
+}
+
 export class SessionStartInjector {
   private readonly bridge: BridgeClient;
   private readonly config: SessionStartConfig;
   private readonly report: FailureReporter;
   private readonly attemptedEpochs = new Set<string>();
+  private readonly injectedSessions = new Set<string>();
+  private enabledOverride: boolean | null = null;
+  private reported = false;
 
   constructor(bridge: BridgeClient, config: SessionStartConfig, report: FailureReporter) {
     this.bridge = bridge;
@@ -209,10 +224,75 @@ export class SessionStartInjector {
     this.report = report;
   }
 
+  getConfig(): SessionStartConfig {
+    return { ...this.config };
+  }
+
+  setEnabledOverride(enabled: boolean | null): void {
+    this.enabledOverride = enabled;
+  }
+
+  effectiveEnabledState(): { enabled: boolean; source: "override" | "env" | "config" } {
+    if (this.enabledOverride !== null) {
+      return { enabled: this.enabledOverride, source: "override" };
+    }
+    const env = parseSessionStartEnvOverride();
+    if (env !== undefined) {
+      return { enabled: env, source: "env" };
+    }
+    return { enabled: this.config.enabled, source: "config" };
+  }
+
+  statusSnapshot(sessionId?: string, ctx?: OmpContext): SessionStartStatusSnapshot {
+    const effective = this.effectiveEnabledState();
+    const env = parseSessionStartEnvOverride();
+    const cleanSid =
+      typeof sessionId === "string" && sessionId.trim() ? sessionId.trim() : undefined;
+    let injectedInCurrentSession = cleanSid ? this.injectedSessions.has(cleanSid) : false;
+    if (!injectedInCurrentSession && ctx) {
+      const entries = getActiveBranchEntries(ctx);
+      let lastCompactionIdx = -1;
+      for (let i = entries.length - 1; i >= 0; i -= 1) {
+        if (entries[i]?.type === "compaction") {
+          lastCompactionIdx = i;
+          break;
+        }
+      }
+      const after = lastCompactionIdx >= 0 ? entries.slice(lastCompactionIdx + 1) : entries;
+      injectedInCurrentSession = after.some(
+        (entry) =>
+          entry?.type === "custom_message" && entry?.customType === CORVUS_MEMORY_CUSTOM_TYPE,
+      );
+    }
+    return {
+      enabled: effective.enabled,
+      source: effective.source,
+      maxChars: this.config.maxChars,
+      maxItems: this.config.maxItems,
+      timeoutMs: this.config.timeoutMs,
+      injectedInCurrentSession,
+      configuredEnabled: this.config.enabled,
+      envOverride: env ?? null,
+      sessionOverride: this.enabledOverride,
+    };
+  }
+
+  private reportOnce(message: string): void {
+    if (this.reported) {
+      return;
+    }
+    this.reported = true;
+    try {
+      this.report(message);
+    } catch {
+      // Never let warning reporting crash omp.
+    }
+  }
+
   async handleBeforeAgentStart(
     ctx: OmpContext | undefined,
   ): Promise<SessionStartInjectionResult | undefined> {
-    if (!isSessionStartEnabled(this.config)) {
+    if (!this.effectiveEnabledState().enabled) {
       return undefined;
     }
 
@@ -248,6 +328,7 @@ export class SessionStartInjector {
     );
     if (alreadyInjectedOnBranch) {
       this.attemptedEpochs.add(dedupeKey);
+      this.injectedSessions.add(sessionId);
       return undefined;
     }
 
@@ -269,8 +350,8 @@ export class SessionStartInjector {
       );
 
       if (!res.ok) {
-        if (res.error.code !== "aborted" && res.error.code !== "closed") {
-          this.report(
+        if (!res.transportFailure && res.error.code !== "aborted" && res.error.code !== "closed") {
+          this.reportOnce(
             `corvus: session-start memory injection error (${res.error.code}: ${res.error.message})`,
           );
         }
@@ -281,7 +362,7 @@ export class SessionStartInjector {
       if (!data || data.degraded) {
         if (data?.degraded) {
           const reason = data.reason ? ` (${data.reason})` : "";
-          this.report(`corvus: session-start memory injection degraded${reason}`);
+          this.reportOnce(`corvus: session-start memory injection degraded${reason}`);
         }
         return undefined;
       }
@@ -299,6 +380,7 @@ export class SessionStartInjector {
         return undefined;
       }
 
+      this.injectedSessions.add(sessionId);
       return {
         message: {
           customType: CORVUS_MEMORY_CUSTOM_TYPE,
@@ -308,7 +390,7 @@ export class SessionStartInjector {
         },
       };
     } catch (err) {
-      this.report(
+      this.reportOnce(
         `corvus: session-start memory injection failed (${err instanceof Error ? err.message : err})`,
       );
       return undefined;

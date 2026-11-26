@@ -17,6 +17,7 @@
     "check": "biome check .",
     "format": "biome format --write .",
     "test": "bun test",
+    "smoke": "bun run scripts/smoke.ts",
     "ci": "bun run typecheck && bun run check && bun test"
   },
   "devDependencies": {
