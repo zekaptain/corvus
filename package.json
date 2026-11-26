@@ -1,0 +1,27 @@
+{
+  "name": "corvus",
+  "version": "0.1.0",
+  "description": "Standalone omp (oh-my-pi) memory extension backed by agent-memory",
+  "type": "module",
+  "license": "Apache-2.0",
+  "bin": {
+    "corvus": "./src/cli/index.ts"
+  },
+  "exports": {
+    ".": "./src/extension/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "biome lint .",
+    "format:check": "biome format --check .",
+    "check": "biome check .",
+    "format": "biome format --write .",
+    "test": "bun test",
+    "ci": "bun run typecheck && bun run check && bun test"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
+    "@types/bun": "^1.2.4",
+    "typescript": "^5.8.2"
+  }
+}
