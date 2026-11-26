@@ -1,21 +1,24 @@
 /**
- * omp capture extension for corvus (backed by agent-memory's `mem records`).
+ * omp extension for corvus (backed by agent-memory's `mem records` and `mem bridge`).
  *
  * Loaded once by omp; omp invokes the default export once per session (main and each
  * spawned subagent) inside the same process. All sessions share one mapper (state keyed
- * by session id) and one `mem records` child process.
+ * by session id), one `mem records` capture sink, and one `mem bridge` tool client.
  */
 
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { BridgeClient, DEFAULT_TOOL_TIMEOUT_MS } from "./bridge.ts";
 import { OmpMapper } from "./mapper.ts";
 import type { OmpContext, OmpHookPayload } from "./mapper.ts";
 import { RecordSink } from "./sink.ts";
 import type { FailureReporter, SinkConfig } from "./sink.ts";
+import { type OmpToolDefinition, registerMemoryTools } from "./tools.ts";
 
 export interface OmpExtensionAPI {
   on: (event: string, handler: (payload: OmpHookPayload, ctx: OmpContext) => unknown) => void;
+  registerTool?: (definition: OmpToolDefinition) => void;
   pi?: {
     VERSION?: string;
   };
@@ -43,11 +46,18 @@ interface StoredConfig {
   home?: unknown;
   port?: unknown;
   spool_only?: unknown;
+  spoolOnly?: unknown;
+  toolTimeoutMs?: unknown;
+  tool_timeout_ms?: unknown;
+}
+
+export interface LoadedExtensionConfig extends SinkConfig {
+  toolTimeoutMs?: number;
 }
 
 export interface ExtensionOptions {
   configPath?: string;
-  config?: SinkConfig;
+  config?: LoadedExtensionConfig;
   report?: FailureReporter;
   clock?: () => string;
 }
@@ -56,9 +66,23 @@ function defaultConfigPath(): string {
   return join(dirname(fileURLToPath(import.meta.url)), "config.json");
 }
 
-function envSinkConfig(): SinkConfig {
+function parsePositiveTimeout(raw: unknown): number | undefined {
+  if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) {
+    return raw;
+  }
+  if (typeof raw === "string" && raw.trim()) {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return undefined;
+}
+
+function envSinkConfig(): LoadedExtensionConfig {
   const portRaw = process.env.AGENT_MEMORY_PORT;
   const portParsed = portRaw ? Number(portRaw) : undefined;
+  const toolTimeoutMs = parsePositiveTimeout(process.env.CORVUS_TOOL_TIMEOUT_MS);
   return {
     mem: process.env.AGENT_MEMORY_MEM || "mem",
     home: process.env.AGENT_MEMORY_HOME || undefined,
@@ -67,10 +91,14 @@ function envSinkConfig(): SinkConfig {
         ? portParsed
         : undefined,
     spoolOnly: process.env.AGENT_MEMORY_SPOOL_ONLY === "1",
+    ...(toolTimeoutMs !== undefined ? { toolTimeoutMs } : {}),
   };
 }
 
-export function loadSinkConfig(configPath: string): { config?: SinkConfig; error?: string } {
+export function loadSinkConfig(configPath: string): {
+  config?: LoadedExtensionConfig;
+  error?: string;
+} {
   let raw: string;
   try {
     raw = readFileSync(configPath, "utf8");
@@ -101,12 +129,17 @@ export function loadSinkConfig(configPath: string): { config?: SinkConfig; error
     typeof stored.port === "number" && Number.isInteger(stored.port) && stored.port > 0
       ? stored.port
       : undefined;
+  const toolTimeoutMs =
+    parsePositiveTimeout(stored.toolTimeoutMs) ??
+    parsePositiveTimeout(stored.tool_timeout_ms) ??
+    parsePositiveTimeout(process.env.CORVUS_TOOL_TIMEOUT_MS);
   return {
     config: {
       mem,
       home,
       port,
-      spoolOnly: stored.spool_only === true,
+      spoolOnly: stored.spoolOnly === true || stored.spool_only === true,
+      ...(toolTimeoutMs !== undefined ? { toolTimeoutMs } : {}),
     },
   };
 }
@@ -116,6 +149,7 @@ export interface CaptureRuntime {
   closeNow: () => void;
   readonly mapper: OmpMapper;
   readonly sink: RecordSink | null;
+  readonly bridge: BridgeClient | null;
 }
 
 export function createRuntime(
@@ -123,13 +157,8 @@ export function createRuntime(
   harnessVersion?: string,
 ): CaptureRuntime {
   let lastCtx: OmpContext | undefined;
-  let reportedOnce = false;
 
-  const report: FailureReporter = (message) => {
-    if (reportedOnce) {
-      return;
-    }
-    reportedOnce = true;
+  const emitWarning: FailureReporter = (message) => {
     if (options.report) {
       options.report(message);
       return;
@@ -149,16 +178,42 @@ export function createRuntime(
     }
   };
 
-  let sink: RecordSink | null = null;
+  let sinkReported = false;
+  const reportSink: FailureReporter = (message) => {
+    if (sinkReported) {
+      return;
+    }
+    sinkReported = true;
+    emitWarning(message);
+  };
+
+  let resolvedConfig: LoadedExtensionConfig | undefined;
+  let configError: string | undefined;
   if (options.config) {
-    sink = new RecordSink(options.config, report);
+    resolvedConfig = options.config;
   } else {
     const loaded = loadSinkConfig(options.configPath ?? defaultConfigPath());
-    if (loaded.config) {
-      sink = new RecordSink(loaded.config, report);
-    } else if (loaded.error) {
-      report(`corvus: capture disabled; ${loaded.error}`);
-    }
+    resolvedConfig = loaded.config;
+    configError = loaded.error;
+  }
+
+  let sink: RecordSink | null = null;
+  let bridge: BridgeClient | null = null;
+  const toolTimeoutMs = resolvedConfig?.toolTimeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS;
+
+  if (resolvedConfig) {
+    sink = new RecordSink(resolvedConfig, reportSink);
+    bridge = new BridgeClient(
+      {
+        mem: resolvedConfig.mem,
+        home: resolvedConfig.home,
+        port: resolvedConfig.port,
+        toolTimeoutMs,
+      },
+      emitWarning,
+    );
+  } else if (configError) {
+    reportSink(`corvus: capture disabled; ${configError}`);
   }
 
   const mapper = new OmpMapper({
@@ -171,20 +226,31 @@ export function createRuntime(
 
   const onBeforeExit = () => {
     sink?.closeNow();
+    bridge?.close();
   };
   process.once("beforeExit", onBeforeExit);
 
   return {
     mapper,
     sink,
+    bridge,
     closeNow: () => {
       process.off("beforeExit", onBeforeExit);
       sink?.closeNow();
+      bridge?.close();
     },
     attach(pi: OmpExtensionAPI): void {
       const instanceId = nextInstanceId++;
       activeInstances += 1;
       let instanceClosed = false;
+
+      registerMemoryTools(pi, bridge, {
+        toolTimeoutMs,
+        disabledReason: configError,
+        onContext: (ctx) => {
+          lastCtx = ctx;
+        },
+      });
 
       for (const eventName of HOOK_EVENTS) {
         pi.on(eventName, (payload, ctx) => {
@@ -197,7 +263,7 @@ export function createRuntime(
               }
             }
           } catch (err) {
-            report(
+            reportSink(
               `corvus: error handling ${eventName} (${err instanceof Error ? err.message : err})`,
             );
           }
@@ -207,6 +273,7 @@ export function createRuntime(
             activeInstances = Math.max(0, activeInstances - 1);
             if (activeInstances === 0) {
               sink?.scheduleClose();
+              bridge?.close();
             }
           }
           // Return undefined so omp never treats this handler as blocking or mutating.
