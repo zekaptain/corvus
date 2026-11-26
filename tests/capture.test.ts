@@ -159,6 +159,16 @@ describe("Architecture constraints", () => {
       const content = readFileSync(file, "utf8");
       assert.equal(/@oh-my-pi\//.test(content), false, `unexpected @oh-my-pi/* import in ${file}`);
     }
+
+    const extFiles = collectTsFiles(join(repoRoot, "src", "extension"));
+    for (const file of extFiles) {
+      const content = readFileSync(file, "utf8");
+      assert.equal(
+        /from\s+["']\.\.\//.test(content),
+        false,
+        `extension file ${file} must stay self-contained without parent imports`,
+      );
+    }
   });
 });
 
@@ -1144,5 +1154,72 @@ setTimeout(() => {}, 20);
       ]),
       { text: "a", hasToolCalls: false, nonTextTypes: ["image"] },
     );
+  });
+
+  it("never misclassifies corvus-memory custom_message as user_msg even when leafId points to it", () => {
+    const mapper = new OmpMapper({ clock: fixedClock() });
+    const sid = "sid-custom-mem-exclusion";
+    const sm = new FakeSessionManager(sid, "/tmp/exclusion.jsonl");
+    const ctx = makeCtx(sm);
+
+    mapper.handle("session_start", {}, ctx, 1);
+
+    // Per MEM-41: omp appends the user message (`9f7ba2a2`), then before_agent_start appends
+    // the `corvus-memory` custom_message (`f03b2ffc`), so leafId already points to `f03b2ffc`
+    // when `message_end` fires for the user message and for the custom_message.
+    const userMsg = {
+      role: "user",
+      content: [{ type: "text", text: "What do we know about Corvus?" }],
+      attribution: "user",
+      timestamp: 1795575570874,
+    };
+    const injectedCustomMsg = {
+      role: "custom",
+      customType: "corvus-memory",
+      content: "# Active memories\n- [mem-1] (global/fact) Use NDJSON bridge",
+      display: false,
+      attribution: "agent",
+      timestamp: 1795575570880,
+    };
+    sm.push({ type: "message", id: "9f7ba2a2", message: userMsg });
+    sm.push({
+      type: "custom_message",
+      id: "f03b2ffc",
+      customType: "corvus-memory",
+      message: injectedCustomMsg,
+    });
+    assert.equal(sm.getLeafId(), "f03b2ffc");
+
+    const userRecords = mapper.handle("message_end", { message: userMsg }, ctx, 1);
+    assert.equal(userRecords.length, 1);
+    assert.equal(userRecords[0].kind, "user_msg");
+    assert.equal(userRecords[0].source_key, "9f7ba2a2");
+    assert.deepEqual(userRecords[0].attribution, { message_id: "9f7ba2a2" });
+
+    // Even if timestamps differed (forcing Pass 2/3), leafId (`f03b2ffc`) must never be chosen.
+    const userMsg2 = {
+      role: "user",
+      content: "Follow-up prompt",
+      attribution: "user",
+      timestamp: 1795575571000,
+    };
+    sm.push({
+      type: "message",
+      id: "aaaa1111",
+      message: { ...userMsg2, timestamp: 1795575570999 },
+    });
+    sm.push({
+      type: "custom_message",
+      id: "bbbb2222",
+      customType: "corvus-memory",
+      message: { ...injectedCustomMsg, timestamp: 1795575571001 },
+    });
+    assert.equal(sm.getLeafId(), "bbbb2222");
+    const userRecords2 = mapper.handle("message_end", { message: userMsg2 }, ctx, 1);
+    assert.equal(userRecords2[0].source_key, "aaaa1111");
+
+    // `message_end` for `role: "custom"` / `customType: "corvus-memory"` emits zero records.
+    const customRecords = mapper.handle("message_end", { message: injectedCustomMsg }, ctx, 1);
+    assert.deepEqual(customRecords, []);
   });
 });

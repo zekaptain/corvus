@@ -6,6 +6,9 @@
 import {
   CORVUS_VERSION,
   DEFAULT_EXTENSIONS_DIR,
+  DEFAULT_SESSION_START_MAX_CHARS,
+  DEFAULT_SESSION_START_MAX_ITEMS,
+  DEFAULT_SESSION_START_TIMEOUT_MS,
   MANAGED_EXTENSION_DIR_NAME,
 } from "../constants.ts";
 import {
@@ -22,6 +25,10 @@ interface ParsedFlags {
   home?: string;
   port?: number;
   spoolOnly?: boolean;
+  sessionStartInjection?: boolean;
+  sessionStartMaxChars?: number;
+  sessionStartMaxItems?: number;
+  sessionStartTimeoutMs?: number;
   json?: boolean;
   help: boolean;
   version: boolean;
@@ -33,20 +40,37 @@ function usageText(): string {
     "",
     "Usage:",
     "  corvus install   [--dir PATH] [--mem PATH] [--home PATH] [--port PORT] [--spool-only]",
-    "  corvus status    [--dir PATH] [--mem PATH] [--home PATH] [--port PORT] [--spool-only] [--json]",
+    "                   [--[no-]session-start-injection] [--session-start-max-chars N]",
+    "                   [--session-start-max-items N] [--session-start-timeout-ms N]",
+    "  corvus status    [--dir PATH] [--mem PATH] [--home PATH] [--port PORT] [--spool-only]",
+    "                   [--[no-]session-start-injection] [--session-start-max-chars N]",
+    "                   [--session-start-max-items N] [--session-start-timeout-ms N] [--json]",
     "  corvus uninstall [--dir PATH]",
     "",
     "Options:",
-    `  --dir PATH     omp extensions directory (default: ${DEFAULT_EXTENSIONS_DIR})`,
-    `                 managed subdirectory: <dir>/${MANAGED_EXTENSION_DIR_NAME}/`,
-    "  --mem PATH     path to the agent-memory `mem` executable",
-    "  --home PATH    agent-memory data directory (default: $AGENT_MEMORY_HOME or ~/.agent-memory)",
-    "  --port PORT    agent-memory Quack port (default: $AGENT_MEMORY_PORT or 9494)",
-    "  --spool-only   write capture records directly to the spool",
-    "  --json         output status as JSON (with `corvus status`)",
-    "  -h, --help     show this help and exit",
-    "  -v, --version  show version and exit",
+    `  --dir PATH                     omp extensions directory (default: ${DEFAULT_EXTENSIONS_DIR})`,
+    `                                 managed subdirectory: <dir>/${MANAGED_EXTENSION_DIR_NAME}/`,
+    "  --mem PATH                     path to the agent-memory `mem` executable",
+    "  --home PATH                    agent-memory data directory (default: $AGENT_MEMORY_HOME or ~/.agent-memory)",
+    "  --port PORT                    agent-memory Quack port (default: $AGENT_MEMORY_PORT or 9494)",
+    "  --spool-only                   write capture records directly to the spool",
+    "  --session-start-injection      enable opt-in session-start memory injection (default: off)",
+    "  --no-session-start-injection   disable session-start memory injection",
+    `  --session-start-max-chars N    max characters for injected block (default: ${DEFAULT_SESSION_START_MAX_CHARS})`,
+    `  --session-start-max-items N    max items for injected block (default: ${DEFAULT_SESSION_START_MAX_ITEMS})`,
+    `  --session-start-timeout-ms N   bridge timeout in ms for session-start injection (default: ${DEFAULT_SESSION_START_TIMEOUT_MS})`,
+    "  --json                         output status as JSON (with `corvus status`)",
+    "  -h, --help                     show this help and exit",
+    "  -v, --version                  show version and exit",
   ].join("\n");
+}
+
+function parsePositiveInt(raw: string, flagName: string): number {
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new InstallerError(`invalid ${flagName} ${raw}; expected positive integer`);
+  }
+  return parsed;
 }
 
 function parseFlags(args: string[]): ParsedFlags {
@@ -69,11 +93,27 @@ function parseFlags(args: string[]): ParsedFlags {
       flags.spoolOnly = true;
       continue;
     }
+    if (arg === "--session-start-injection") {
+      flags.sessionStartInjection = true;
+      continue;
+    }
+    if (arg === "--no-session-start-injection") {
+      flags.sessionStartInjection = false;
+      continue;
+    }
     if (arg === "--json") {
       flags.json = true;
       continue;
     }
-    if (arg === "--dir" || arg === "--mem" || arg === "--home" || arg === "--port") {
+    if (
+      arg === "--dir" ||
+      arg === "--mem" ||
+      arg === "--home" ||
+      arg === "--port" ||
+      arg === "--session-start-max-chars" ||
+      arg === "--session-start-max-items" ||
+      arg === "--session-start-timeout-ms"
+    ) {
       const value = args[i + 1];
       if (value === undefined || value.startsWith("-")) {
         throw new InstallerError(`${arg} requires a value`);
@@ -88,6 +128,12 @@ function parseFlags(args: string[]): ParsedFlags {
           throw new InstallerError(`invalid --port ${value}; expected integer 1..65535`);
         }
         flags.port = parsed;
+      } else if (arg === "--session-start-max-chars") {
+        flags.sessionStartMaxChars = parsePositiveInt(value, arg);
+      } else if (arg === "--session-start-max-items") {
+        flags.sessionStartMaxItems = parsePositiveInt(value, arg);
+      } else if (arg === "--session-start-timeout-ms") {
+        flags.sessionStartTimeoutMs = parsePositiveInt(value, arg);
       }
       continue;
     }
@@ -110,6 +156,27 @@ function parseFlags(args: string[]): ParsedFlags {
         throw new InstallerError(`invalid --port ${raw}; expected integer 1..65535`);
       }
       flags.port = parsed;
+      continue;
+    }
+    if (arg.startsWith("--session-start-max-chars=")) {
+      flags.sessionStartMaxChars = parsePositiveInt(
+        arg.slice("--session-start-max-chars=".length),
+        "--session-start-max-chars",
+      );
+      continue;
+    }
+    if (arg.startsWith("--session-start-max-items=")) {
+      flags.sessionStartMaxItems = parsePositiveInt(
+        arg.slice("--session-start-max-items=".length),
+        "--session-start-max-items",
+      );
+      continue;
+    }
+    if (arg.startsWith("--session-start-timeout-ms=")) {
+      flags.sessionStartTimeoutMs = parsePositiveInt(
+        arg.slice("--session-start-timeout-ms=".length),
+        "--session-start-timeout-ms",
+      );
       continue;
     }
     throw new InstallerError(`unknown argument: ${arg}`);
@@ -171,6 +238,10 @@ export function runCli(
             home: flags.home,
             port: flags.port,
             spoolOnly: flags.spoolOnly,
+            sessionStartInjection: flags.sessionStartInjection,
+            sessionStartMaxChars: flags.sessionStartMaxChars,
+            sessionStartMaxItems: flags.sessionStartMaxItems,
+            sessionStartTimeoutMs: flags.sessionStartTimeoutMs,
           },
           io,
         );
@@ -184,6 +255,10 @@ export function runCli(
             home: flags.home,
             port: flags.port,
             spoolOnly: flags.spoolOnly,
+            sessionStartInjection: flags.sessionStartInjection,
+            sessionStartMaxChars: flags.sessionStartMaxChars,
+            sessionStartMaxItems: flags.sessionStartMaxItems,
+            sessionStartTimeoutMs: flags.sessionStartTimeoutMs,
             json: flags.json,
           },
           io,
@@ -196,6 +271,10 @@ export function runCli(
           flags.home !== undefined ||
           flags.port !== undefined ||
           flags.spoolOnly !== undefined ||
+          flags.sessionStartInjection !== undefined ||
+          flags.sessionStartMaxChars !== undefined ||
+          flags.sessionStartMaxItems !== undefined ||
+          flags.sessionStartTimeoutMs !== undefined ||
           flags.json !== undefined
         ) {
           throw new InstallerError("uninstall accepts only --dir");
