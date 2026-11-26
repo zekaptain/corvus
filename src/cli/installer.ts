@@ -33,6 +33,7 @@ import {
   CORVUS_VERSION,
   DEFAULT_EXTENSIONS_DIR,
   EXTENSION_SOURCE_FILES,
+  LEGACY_EXTENSION_DIR_NAME,
   MANAGED_EXTENSION_DIR_NAME,
   MANAGED_FILES,
   MANIFEST_FILE_NAME,
@@ -65,11 +66,30 @@ export interface StatusOptions {
   home?: string;
   port?: number;
   spoolOnly?: boolean;
+  json?: boolean;
   sourceDir?: string;
 }
 
 export interface UninstallOptions {
   dir?: string;
+}
+
+export interface InstallResult {
+  target: string;
+  action: "installed" | "updated" | "unchanged";
+  siblingConflict: string | null;
+  warnings: string[];
+}
+
+export interface StatusResult {
+  ok: boolean;
+  installed: boolean;
+  target: string;
+  version: string | null;
+  files: Record<string, string>;
+  command: string | null;
+  siblingConflict: string | null;
+  warnings: string[];
 }
 
 export interface CliIO {
@@ -441,6 +461,23 @@ function shellQuote(arg: string): string {
   return `'${arg.replace(/'/g, `'\\''`)}'`;
 }
 
+function detectSiblingConflict(extensionsDir: string): { path: string; warning: string } | null {
+  const managedName: string = MANAGED_EXTENSION_DIR_NAME;
+  if (managedName === LEGACY_EXTENSION_DIR_NAME) {
+    return null;
+  }
+  const siblingPath = join(extensionsDir, LEGACY_EXTENSION_DIR_NAME);
+  try {
+    lstatSync(siblingPath);
+  } catch {
+    return null;
+  }
+  return {
+    path: siblingPath,
+    warning: `sibling ${LEGACY_EXTENSION_DIR_NAME} extension found at ${siblingPath}; omp auto-loads both extensions, causing duplicate session capture. Run \`mem extension uninstall\` to prevent duplicate capture`,
+  };
+}
+
 function formatMemCommand(mem: string, home?: string, port?: number, spoolOnly?: boolean): string {
   const parts = [mem];
   if (home) {
@@ -456,10 +493,7 @@ function formatMemCommand(mem: string, home?: string, port?: number, spoolOnly?:
   return parts.map(shellQuote).join(" ");
 }
 
-export function installExtension(
-  options: InstallOptions,
-  io: CliIO = defaultIO(),
-): { target: string; action: "installed" | "updated" | "unchanged" } {
+export function installExtension(options: InstallOptions, io: CliIO = defaultIO()): InstallResult {
   const extensionsDir = resolveExtensionsDir(options.dir);
   const memPath = resolveMemForInstall(options.mem);
   const homePath = resolveHome(options.home);
@@ -503,6 +537,9 @@ export function installExtension(
     throw new InstallerError(`${inspected.reason}; nothing was changed`);
   }
 
+  const sibling = detectSiblingConflict(extensionsDir);
+  const warnings = sibling ? [sibling.warning] : [];
+
   if (inspected.state === "managed") {
     if (inspected.missing.length > 0 || inspected.modified.length > 0) {
       const problems: string[] = [];
@@ -526,7 +563,15 @@ export function installExtension(
       io.stdout(`runs: ${formatMemCommand(memPath, homePath, port, spoolOnly)}`);
       const others = formatOthersLine(extensionsDir);
       if (others) io.stdout(others);
-      return { target, action: "unchanged" };
+      for (const warning of warnings) {
+        io.stderr(`corvus: warning: ${warning}`);
+      }
+      return {
+        target,
+        action: "unchanged",
+        siblingConflict: sibling?.path ?? null,
+        warnings,
+      };
     }
 
     for (const name of PAYLOAD_FILES) {
@@ -543,8 +588,16 @@ export function installExtension(
     io.stdout(`runs: ${formatMemCommand(memPath, homePath, port, spoolOnly)}`);
     const others = formatOthersLine(extensionsDir);
     if (others) io.stdout(others);
+    for (const warning of warnings) {
+      io.stderr(`corvus: warning: ${warning}`);
+    }
     io.stdout("Start a new omp session to pick up the change.");
-    return { target, action: "updated" };
+    return {
+      target,
+      action: "updated",
+      siblingConflict: sibling?.path ?? null,
+      warnings,
+    };
   }
 
   // Fresh install: stage in a sibling temp directory and atomically rename into place.
@@ -567,24 +620,68 @@ export function installExtension(
   io.stdout(`runs: ${formatMemCommand(memPath, homePath, port, spoolOnly)}`);
   const others = formatOthersLine(extensionsDir);
   if (others) io.stdout(others);
+  for (const warning of warnings) {
+    io.stderr(`corvus: warning: ${warning}`);
+  }
   io.stdout("Start a new omp session to pick up the change.");
-  return { target, action: "installed" };
+  return {
+    target,
+    action: "installed",
+    siblingConflict: sibling?.path ?? null,
+    warnings,
+  };
 }
 
-export function statusExtension(options: StatusOptions, io: CliIO = defaultIO()): boolean {
+export function statusExtension(options: StatusOptions, io: CliIO = defaultIO()): StatusResult {
   const extensionsDir = resolveExtensionsDir(options.dir);
   const target = join(extensionsDir, MANAGED_EXTENSION_DIR_NAME);
   const sourceDir = options.sourceDir ?? defaultSourceDir();
   const inspected = inspectTarget(target);
+  const sibling = detectSiblingConflict(extensionsDir);
+  const warnings = sibling ? [sibling.warning] : [];
 
   if (inspected.state === "absent") {
-    io.stdout(`${target} (not installed)`);
-    return false;
+    const result: StatusResult = {
+      ok: false,
+      installed: false,
+      target,
+      version: null,
+      files: {},
+      command: null,
+      siblingConflict: sibling?.path ?? null,
+      warnings,
+    };
+    if (options.json) {
+      io.stdout(JSON.stringify(result, null, 2));
+    } else {
+      io.stdout(`${target} (not installed)`);
+      for (const warning of warnings) {
+        io.stdout(`warning: ${warning}`);
+      }
+    }
+    return result;
   }
 
   if (inspected.state === "invalid") {
-    io.stdout(`${target} (${inspected.reason})`);
-    return false;
+    const result: StatusResult = {
+      ok: false,
+      installed: false,
+      target,
+      version: null,
+      files: {},
+      command: null,
+      siblingConflict: sibling?.path ?? null,
+      warnings,
+    };
+    if (options.json) {
+      io.stdout(JSON.stringify(result, null, 2));
+    } else {
+      io.stdout(`${target} (${inspected.reason})`);
+      for (const warning of warnings) {
+        io.stdout(`warning: ${warning}`);
+      }
+    }
+    return result;
   }
 
   const installedCfg = readInstalledConfig(join(target, CONFIG_FILE_NAME));
@@ -632,29 +729,52 @@ export function statusExtension(options: StatusOptions, io: CliIO = defaultIO())
     }
   }
 
+  const command =
+    typeof installedCfg?.mem === "string"
+      ? formatMemCommand(
+          installedCfg.mem,
+          typeof installedCfg.home === "string" ? installedCfg.home : undefined,
+          typeof installedCfg.port === "number" ? installedCfg.port : undefined,
+          installedCfg.spool_only === true,
+        )
+      : null;
+
+  const ok =
+    inspected.manifest.version === CORVUS_VERSION &&
+    Object.values(fileStates).every((state) => state === "installed");
+
+  const result: StatusResult = {
+    ok,
+    installed: true,
+    target,
+    version: inspected.manifest.version,
+    files: fileStates,
+    command,
+    siblingConflict: sibling?.path ?? null,
+    warnings,
+  };
+
+  if (options.json) {
+    io.stdout(JSON.stringify(result, null, 2));
+    return result;
+  }
+
   io.stdout(`${target} (${OWNER_MARKER} v${inspected.manifest.version})`);
   const width = Math.max(...Object.keys(fileStates).map((k) => k.length));
   for (const [name, state] of Object.entries(fileStates)) {
     io.stdout(`  ${name.padEnd(width)}  ${state}`);
   }
 
-  if (typeof installedCfg?.mem === "string") {
-    io.stdout(
-      `runs: ${formatMemCommand(
-        installedCfg.mem,
-        typeof installedCfg.home === "string" ? installedCfg.home : undefined,
-        typeof installedCfg.port === "number" ? installedCfg.port : undefined,
-        installedCfg.spool_only === true,
-      )}`,
-    );
+  if (command) {
+    io.stdout(`runs: ${command}`);
   }
   const others = formatOthersLine(extensionsDir);
   if (others) io.stdout(others);
+  for (const warning of warnings) {
+    io.stdout(`warning: ${warning}`);
+  }
 
-  return (
-    inspected.manifest.version === CORVUS_VERSION &&
-    Object.values(fileStates).every((state) => state === "installed")
-  );
+  return result;
 }
 
 function resolveMemForStatus(given: string): string {

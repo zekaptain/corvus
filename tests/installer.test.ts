@@ -16,11 +16,12 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 import { runCli } from "../src/cli/index.ts";
-import { sha256Hex } from "../src/cli/installer.ts";
+import { installExtension, sha256Hex, statusExtension } from "../src/cli/installer.ts";
 import {
   CONFIG_FILE_NAME,
   CORVUS_VERSION,
   EXTENSION_SOURCE_FILES,
+  LEGACY_EXTENSION_DIR_NAME,
   MANAGED_EXTENSION_DIR_NAME,
   MANAGED_FILES,
   MANIFEST_FILE_NAME,
@@ -217,6 +218,82 @@ describe("corvus installer CLI", () => {
     assert.match(uninst.stdout, /2 other extensions were left alone/);
     assert.equal(readFileSync(siblingFile, "utf8"), "export default function () {}\n");
     assert.equal(readFileSync(join(siblingDir, "index.ts"), "utf8"), "// existing extension\n");
+  });
+
+  it("warns on sibling agent-memory extension in install and status without modifying it", () => {
+    const cli = createTestCli();
+    const siblingDir = join(extDir, LEGACY_EXTENSION_DIR_NAME);
+    const siblingEntry = join(siblingDir, "index.ts");
+    const siblingContent = "// legacy agent-memory extension\n";
+    mkdirSync(siblingDir);
+    writeFileSync(siblingEntry, siblingContent);
+
+    // installExtension returns siblingConflict + warnings and leaves agent-memory/ untouched
+    const installOut: string[] = [];
+    const installErr: string[] = [];
+    const installRes = installExtension(
+      { dir: extDir, mem: memBin, home: homeDir },
+      {
+        stdout: (line) => installOut.push(line),
+        stderr: (line) => installErr.push(line),
+      },
+    );
+    assert.equal(installRes.action, "installed");
+    assert.equal(installRes.siblingConflict, siblingDir);
+    assert.equal(installRes.warnings.length, 1);
+    assert.match(installRes.warnings[0] ?? "", /agent-memory/);
+    assert.match(installRes.warnings[0] ?? "", /mem extension uninstall/);
+    assert.match(installErr.join("\n"), /warning:.*agent-memory/);
+    assert.match(installErr.join("\n"), /mem extension uninstall/);
+    assert.equal(readFileSync(siblingEntry, "utf8"), siblingContent);
+
+    // Re-running install via CLI also succeeds, warns on stderr, and keeps agent-memory/ untouched
+    const cliInst = cli(["install", "--dir", extDir, "--mem", memBin, "--home", homeDir]);
+    assert.equal(cliInst.code, 0, cliInst.stderr);
+    assert.match(cliInst.stderr, /warning:.*agent-memory/);
+    assert.match(cliInst.stderr, /mem extension uninstall/);
+    assert.equal(readFileSync(siblingEntry, "utf8"), siblingContent);
+
+    // statusExtension and CLI status (text and --json) report the sibling conflict warning
+    const stResult = statusExtension(
+      { dir: extDir },
+      { stdout: () => undefined, stderr: () => undefined },
+    );
+    assert.equal(stResult.ok, true);
+    assert.equal(stResult.siblingConflict, siblingDir);
+    assert.equal(stResult.warnings.length, 1);
+    assert.match(stResult.warnings[0] ?? "", /mem extension uninstall/);
+
+    const cliStatus = cli(["status", "--dir", extDir]);
+    assert.equal(cliStatus.code, 0, cliStatus.stderr);
+    assert.match(cliStatus.stdout, /warning:.*agent-memory/);
+    assert.match(cliStatus.stdout, /mem extension uninstall/);
+
+    const cliStatusJson = cli(["status", "--dir", extDir, "--json"]);
+    assert.equal(cliStatusJson.code, 0, cliStatusJson.stderr);
+    const parsedJson = JSON.parse(cliStatusJson.stdout) as {
+      ok: boolean;
+      siblingConflict: string | null;
+      warnings: string[];
+    };
+    assert.equal(parsedJson.ok, true);
+    assert.equal(parsedJson.siblingConflict, siblingDir);
+    assert.equal(parsedJson.warnings.length, 1);
+    assert.match(parsedJson.warnings[0] ?? "", /agent-memory/);
+
+    // Once sibling agent-memory/ is removed, status reports no conflict or warning
+    rmSync(siblingDir, { recursive: true, force: true });
+    const cleanStatusResult = statusExtension(
+      { dir: extDir },
+      { stdout: () => undefined, stderr: () => undefined },
+    );
+    assert.equal(cleanStatusResult.ok, true);
+    assert.equal(cleanStatusResult.siblingConflict, null);
+    assert.deepEqual(cleanStatusResult.warnings, []);
+
+    const cleanCliStatus = cli(["status", "--dir", extDir]);
+    assert.equal(cleanCliStatus.code, 0, cleanCliStatus.stderr);
+    assert.doesNotMatch(cleanCliStatus.stdout, /warning:/);
   });
 
   it("creates missing extensions dir when parent exists and refuses when parent is missing", () => {
