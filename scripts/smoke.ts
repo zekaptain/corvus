@@ -15,9 +15,9 @@
 
 import assert from "node:assert/strict";
 import { type ChildProcess, spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { createServer } from "node:net";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { type CliIO, installExtension, statusExtension } from "../src/cli/installer.ts";
@@ -1034,6 +1034,11 @@ async function runPhaseB(args: SmokeArgs, tmpRoot: string): Promise<void> {
   mkdirSync(extensionsDir, { recursive: true });
   mkdirSync(ompSessionsDir, { recursive: true });
   mkdirSync(projectDir, { recursive: true });
+  const hostDuckDbDir = join(homedir(), ".duckdb");
+  const isolatedDuckDbDir = join(ompHome, ".duckdb");
+  if (existsSync(hostDuckDbDir) && !existsSync(isolatedDuckDbDir)) {
+    symlinkSync(hostDuckDbDir, isolatedDuckDbDir);
+  }
 
   const port = await allocateEphemeralPort();
   console.log(`[phase-b] Initializing throwaway Phase B home at ${ompMemHome} (port ${port})...`);
@@ -1094,8 +1099,8 @@ async function runPhaseB(args: SmokeArgs, tmpRoot: string): Promise<void> {
       `omp /corvus status failed (${statusRun.code}): ${statusRun.stderr || statusRun.stdout}`,
     );
     assert.ok(
-      statusRun.stdout.includes("corvus-command") || statusRun.stdout.includes("Ledger: reachable"),
-      `Expected /corvus status output in omp JSON stream, got:\n${statusRun.stdout}`,
+      statusRun.stdout.includes("corvus-command") && statusRun.stdout.includes("Ledger: reachable"),
+      `Expected reachable /corvus status output in omp JSON stream, got:\n${statusRun.stdout}`,
     );
 
     if (args.model) {

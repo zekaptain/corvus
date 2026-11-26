@@ -252,6 +252,10 @@ export class BridgeClient {
         resolve(result as BridgeCallResult<T>);
       };
 
+      // Keep the timeout timer ref'd while a call is in flight so hosts with no other active
+      // handles (e.g. `omp -p "/corvus status"`) do not drain the event loop and trigger
+      // `beforeExit` before the bridge responds. `finish()` clears this timer on every outcome,
+      // leaving the idle unref'd child free not to block process exit.
       const timer = setTimeout(() => {
         if (settled) {
           return;
@@ -267,7 +271,6 @@ export class BridgeClient {
         this.failAllPending("bridge_timeout", message);
         this.teardownChild(true);
       }, timeoutMs);
-      timer.unref?.();
 
       let cleanupSignal = () => {};
       if (options.signal) {

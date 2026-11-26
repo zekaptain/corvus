@@ -466,7 +466,10 @@ describe("/corvus slash command (MEM-43)", () => {
       sessionManager: new CommandSessionManager("sid-degraded"),
     };
     pi.emitSync("session_start", {}, ctx);
-    await new Promise((r) => setTimeout(r, 80));
+    const deadline = Date.now() + 2_000;
+    while (!runtime.sink?.isFailed && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
 
     const res = await cmd.handler("status", ctx);
     assert.match(res.content, /Ledger: unreachable/);

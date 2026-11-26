@@ -369,7 +369,7 @@ process.stdin.on("data", (chunk) => {
     deadClient.close();
   });
 
-  it("unrefs the bridge child and stdio streams so a live bridge never blocks process exit", () => {
+  it("keeps the event loop alive while a call is in flight, then exits promptly with idle unref'd bridge", () => {
     const pidFile = join(tempDir, "live-bridge.pid");
     const fakeMem = writeFakeBridgeScript(
       tempDir,
@@ -385,7 +385,10 @@ process.stdin.on("data", (chunk) => {
     buf = buf.slice(idx + 1);
     if (line) {
       const req = JSON.parse(line);
-      process.stdout.write(JSON.stringify({ id: req.id, ok: true, result: { ok: true } }) + "\\n");
+      // Delay slightly so the event loop would drain if no ref were held during the call.
+      setTimeout(() => {
+        process.stdout.write(JSON.stringify({ id: req.id, ok: true, result: { ok: true } }) + "\\n");
+      }, 60);
     }
     idx = buf.indexOf("\\n");
   }
@@ -401,8 +404,9 @@ setTimeout(() => {}, 15000);
       runner,
       `import { BridgeClient } from ${JSON.stringify(bridgePath)};
 const client = new BridgeClient({ mem: ${JSON.stringify(fakeMem)} }, () => {});
-await client.call("status", { harnessSessionId: "sid-unref" }, {});
-// Intentionally do not call client.close(); process should exit immediately because child is unref'd.
+const res = await client.call("status", { harnessSessionId: "sid-unref" }, {});
+console.log(JSON.stringify(res));
+// Intentionally do not call client.close(); process should exit immediately after call settles.
 `,
     );
 
@@ -413,6 +417,8 @@ await client.call("status", { harnessSessionId: "sid-unref" }, {});
     });
     const elapsed = Date.now() - t0;
     assert.equal(proc.exitCode, 0, proc.stderr.toString());
+    const out = JSON.parse(proc.stdout.toString().trim()) as { ok: boolean };
+    assert.equal(out.ok, true);
     assert.ok(elapsed < 2_000, `expected prompt exit with unref'd bridge, took ${elapsed}ms`);
 
     try {
