@@ -80,6 +80,7 @@ export interface OmpSessionManager {
   getSessionId?: () => string | undefined;
   getSessionFile?: () => string | undefined;
   getEntries?: () => OmpSessionEntry[];
+  getBranch?: () => OmpSessionEntry[];
   getLeafId?: () => string | null | undefined;
   getHeader?: () => OmpSessionHeader | undefined;
 }

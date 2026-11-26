@@ -32,6 +32,10 @@ import {
   CONFIG_FILE_NAME,
   CORVUS_VERSION,
   DEFAULT_EXTENSIONS_DIR,
+  DEFAULT_SESSION_START_INJECTION,
+  DEFAULT_SESSION_START_MAX_CHARS,
+  DEFAULT_SESSION_START_MAX_ITEMS,
+  DEFAULT_SESSION_START_TIMEOUT_MS,
   EXTENSION_SOURCE_FILES,
   LEGACY_EXTENSION_DIR_NAME,
   MANAGED_EXTENSION_DIR_NAME,
@@ -56,7 +60,11 @@ export interface InstallOptions {
   home?: string;
   port?: number;
   spoolOnly?: boolean;
-  /** Override source directory containing `index.ts`, `mapper.ts`, `sink.ts` (for tests). */
+  sessionStartInjection?: boolean;
+  sessionStartMaxChars?: number;
+  sessionStartMaxItems?: number;
+  sessionStartTimeoutMs?: number;
+  /** Override source directory containing extension files (for tests). */
   sourceDir?: string;
 }
 
@@ -66,6 +74,10 @@ export interface StatusOptions {
   home?: string;
   port?: number;
   spoolOnly?: boolean;
+  sessionStartInjection?: boolean;
+  sessionStartMaxChars?: number;
+  sessionStartMaxItems?: number;
+  sessionStartTimeoutMs?: number;
   json?: boolean;
   sourceDir?: string;
 }
@@ -81,6 +93,13 @@ export interface InstallResult {
   warnings: string[];
 }
 
+export interface SessionStartStatus {
+  enabled: boolean;
+  maxChars: number;
+  maxItems: number;
+  timeoutMs: number;
+}
+
 export interface StatusResult {
   ok: boolean;
   installed: boolean;
@@ -88,6 +107,8 @@ export interface StatusResult {
   version: string | null;
   files: Record<string, string>;
   command: string | null;
+  sessionStartInjection: boolean | null;
+  sessionStart: SessionStartStatus | null;
   siblingConflict: string | null;
   warnings: string[];
 }
@@ -109,6 +130,21 @@ interface InstalledConfig {
   home?: unknown;
   port?: unknown;
   spool_only?: unknown;
+  sessionStartInjection?: unknown;
+  sessionStartMaxChars?: unknown;
+  sessionStartMaxItems?: unknown;
+  sessionStartTimeoutMs?: unknown;
+}
+
+interface DesiredConfigValues {
+  memPath: string;
+  homePath: string;
+  port: number;
+  spoolOnly: boolean;
+  sessionStartInjection: boolean;
+  sessionStartMaxChars: number;
+  sessionStartMaxItems: number;
+  sessionStartTimeoutMs: number;
 }
 
 type InspectionResult =
@@ -216,28 +252,42 @@ function resolveExtensionsDir(given?: string): string {
   return resolve(expandTilde(raw));
 }
 
-function buildConfigBytes(
-  memPath: string,
-  homePath: string,
-  port: number,
-  spoolOnly: boolean,
-): Buffer {
+function resolvePositiveIntOption(
+  given: number | undefined,
+  flag: string,
+  fallback: number,
+): number {
+  if (given === undefined) {
+    return fallback;
+  }
+  if (!Number.isInteger(given) || given <= 0) {
+    throw new InstallerError(`invalid ${flag} ${given}; expected positive integer`);
+  }
+  return given;
+}
+
+function formatSessionStartSummary(status: SessionStartStatus): string {
+  return `sessionStartInjection: ${status.enabled ? "enabled" : "disabled"} (maxChars=${status.maxChars}, maxItems=${status.maxItems}, timeoutMs=${status.timeoutMs})`;
+}
+
+function buildConfigBytes(cfg: DesiredConfigValues): Buffer {
   const payload = {
     managed_by: OWNER_MARKER,
-    mem: memPath,
-    home: homePath,
-    port,
-    spool_only: spoolOnly,
+    mem: cfg.memPath,
+    home: cfg.homePath,
+    port: cfg.port,
+    spool_only: cfg.spoolOnly,
+    sessionStartInjection: cfg.sessionStartInjection,
+    sessionStartMaxChars: cfg.sessionStartMaxChars,
+    sessionStartMaxItems: cfg.sessionStartMaxItems,
+    sessionStartTimeoutMs: cfg.sessionStartTimeoutMs,
   };
   return Buffer.from(`${JSON.stringify(payload, null, 2)}\n`, "utf8");
 }
 
 function buildDesiredFiles(
   sourceDir: string,
-  memPath: string,
-  homePath: string,
-  port: number,
-  spoolOnly: boolean,
+  cfg: DesiredConfigValues,
 ): Record<string, { data: Buffer; mode: number }> {
   const files: Record<string, { data: Buffer; mode: number }> = {};
   const hashes: Record<string, string> = {};
@@ -259,7 +309,7 @@ function buildDesiredFiles(
     hashes[name] = sha256Hex(data);
   }
 
-  const configData = buildConfigBytes(memPath, homePath, port, spoolOnly);
+  const configData = buildConfigBytes(cfg);
   files[CONFIG_FILE_NAME] = { data: configData, mode: 0o600 };
   hashes[CONFIG_FILE_NAME] = sha256Hex(configData);
 
@@ -499,6 +549,22 @@ export function installExtension(options: InstallOptions, io: CliIO = defaultIO(
   const homePath = resolveHome(options.home);
   const port = resolvePort(options.port);
   const spoolOnly = Boolean(options.spoolOnly);
+  const sessionStartInjection = options.sessionStartInjection ?? DEFAULT_SESSION_START_INJECTION;
+  const sessionStartMaxChars = resolvePositiveIntOption(
+    options.sessionStartMaxChars,
+    "--session-start-max-chars",
+    DEFAULT_SESSION_START_MAX_CHARS,
+  );
+  const sessionStartMaxItems = resolvePositiveIntOption(
+    options.sessionStartMaxItems,
+    "--session-start-max-items",
+    DEFAULT_SESSION_START_MAX_ITEMS,
+  );
+  const sessionStartTimeoutMs = resolvePositiveIntOption(
+    options.sessionStartTimeoutMs,
+    "--session-start-timeout-ms",
+    DEFAULT_SESSION_START_TIMEOUT_MS,
+  );
   const sourceDir = options.sourceDir ?? defaultSourceDir();
 
   if (existsSync(extensionsDir)) {
@@ -530,7 +596,22 @@ export function installExtension(options: InstallOptions, io: CliIO = defaultIO(
   }
 
   const target = join(extensionsDir, MANAGED_EXTENSION_DIR_NAME);
-  const desired = buildDesiredFiles(sourceDir, memPath, homePath, port, spoolOnly);
+  const desired = buildDesiredFiles(sourceDir, {
+    memPath,
+    homePath,
+    port,
+    spoolOnly,
+    sessionStartInjection,
+    sessionStartMaxChars,
+    sessionStartMaxItems,
+    sessionStartTimeoutMs,
+  });
+  const sessionStartStatus: SessionStartStatus = {
+    enabled: sessionStartInjection,
+    maxChars: sessionStartMaxChars,
+    maxItems: sessionStartMaxItems,
+    timeoutMs: sessionStartTimeoutMs,
+  };
   const inspected = inspectTarget(target);
 
   if (inspected.state === "invalid") {
@@ -561,6 +642,7 @@ export function installExtension(options: InstallOptions, io: CliIO = defaultIO(
     if (unchanged) {
       io.stdout(`already installed in ${target}; nothing to change`);
       io.stdout(`runs: ${formatMemCommand(memPath, homePath, port, spoolOnly)}`);
+      io.stdout(formatSessionStartSummary(sessionStartStatus));
       const others = formatOthersLine(extensionsDir);
       if (others) io.stdout(others);
       for (const warning of warnings) {
@@ -586,6 +668,7 @@ export function installExtension(options: InstallOptions, io: CliIO = defaultIO(
 
     io.stdout(`updated ${OWNER_MARKER} extension in ${target}`);
     io.stdout(`runs: ${formatMemCommand(memPath, homePath, port, spoolOnly)}`);
+    io.stdout(formatSessionStartSummary(sessionStartStatus));
     const others = formatOthersLine(extensionsDir);
     if (others) io.stdout(others);
     for (const warning of warnings) {
@@ -618,6 +701,7 @@ export function installExtension(options: InstallOptions, io: CliIO = defaultIO(
 
   io.stdout(`installed ${OWNER_MARKER} extension in ${target}`);
   io.stdout(`runs: ${formatMemCommand(memPath, homePath, port, spoolOnly)}`);
+  io.stdout(formatSessionStartSummary(sessionStartStatus));
   const others = formatOthersLine(extensionsDir);
   if (others) io.stdout(others);
   for (const warning of warnings) {
@@ -648,6 +732,8 @@ export function statusExtension(options: StatusOptions, io: CliIO = defaultIO())
       version: null,
       files: {},
       command: null,
+      sessionStartInjection: null,
+      sessionStart: null,
       siblingConflict: sibling?.path ?? null,
       warnings,
     };
@@ -670,6 +756,8 @@ export function statusExtension(options: StatusOptions, io: CliIO = defaultIO())
       version: null,
       files: {},
       command: null,
+      sessionStartInjection: null,
+      sessionStart: null,
       siblingConflict: sibling?.path ?? null,
       warnings,
     };
@@ -714,7 +802,57 @@ export function statusExtension(options: StatusOptions, io: CliIO = defaultIO())
     options.spoolOnly ??
     (typeof installedCfg?.spool_only === "boolean" ? installedCfg.spool_only : false);
 
-  const desired = buildDesiredFiles(sourceDir, memForComparison, homePath, port, spoolOnly);
+  const installedSessionStartInjection =
+    typeof installedCfg?.sessionStartInjection === "boolean"
+      ? installedCfg.sessionStartInjection
+      : DEFAULT_SESSION_START_INJECTION;
+  const installedMaxChars =
+    typeof installedCfg?.sessionStartMaxChars === "number" &&
+    Number.isInteger(installedCfg.sessionStartMaxChars) &&
+    installedCfg.sessionStartMaxChars > 0
+      ? installedCfg.sessionStartMaxChars
+      : DEFAULT_SESSION_START_MAX_CHARS;
+  const installedMaxItems =
+    typeof installedCfg?.sessionStartMaxItems === "number" &&
+    Number.isInteger(installedCfg.sessionStartMaxItems) &&
+    installedCfg.sessionStartMaxItems > 0
+      ? installedCfg.sessionStartMaxItems
+      : DEFAULT_SESSION_START_MAX_ITEMS;
+  const installedTimeoutMs =
+    typeof installedCfg?.sessionStartTimeoutMs === "number" &&
+    Number.isInteger(installedCfg.sessionStartTimeoutMs) &&
+    installedCfg.sessionStartTimeoutMs > 0
+      ? installedCfg.sessionStartTimeoutMs
+      : DEFAULT_SESSION_START_TIMEOUT_MS;
+
+  const comparedSessionStartInjection =
+    options.sessionStartInjection ?? installedSessionStartInjection;
+  const comparedMaxChars = resolvePositiveIntOption(
+    options.sessionStartMaxChars,
+    "--session-start-max-chars",
+    installedMaxChars,
+  );
+  const comparedMaxItems = resolvePositiveIntOption(
+    options.sessionStartMaxItems,
+    "--session-start-max-items",
+    installedMaxItems,
+  );
+  const comparedTimeoutMs = resolvePositiveIntOption(
+    options.sessionStartTimeoutMs,
+    "--session-start-timeout-ms",
+    installedTimeoutMs,
+  );
+
+  const desired = buildDesiredFiles(sourceDir, {
+    memPath: memForComparison,
+    homePath,
+    port,
+    spoolOnly,
+    sessionStartInjection: comparedSessionStartInjection,
+    sessionStartMaxChars: comparedMaxChars,
+    sessionStartMaxItems: comparedMaxItems,
+    sessionStartTimeoutMs: comparedTimeoutMs,
+  });
 
   const fileStates: Record<string, string> = {};
   for (const name of PAYLOAD_FILES) {
@@ -739,6 +877,13 @@ export function statusExtension(options: StatusOptions, io: CliIO = defaultIO())
         )
       : null;
 
+  const sessionStartStatus: SessionStartStatus = {
+    enabled: installedSessionStartInjection,
+    maxChars: installedMaxChars,
+    maxItems: installedMaxItems,
+    timeoutMs: installedTimeoutMs,
+  };
+
   const ok =
     inspected.manifest.version === CORVUS_VERSION &&
     Object.values(fileStates).every((state) => state === "installed");
@@ -750,6 +895,8 @@ export function statusExtension(options: StatusOptions, io: CliIO = defaultIO())
     version: inspected.manifest.version,
     files: fileStates,
     command,
+    sessionStartInjection: installedSessionStartInjection,
+    sessionStart: sessionStartStatus,
     siblingConflict: sibling?.path ?? null,
     warnings,
   };
@@ -768,6 +915,7 @@ export function statusExtension(options: StatusOptions, io: CliIO = defaultIO())
   if (command) {
     io.stdout(`runs: ${command}`);
   }
+  io.stdout(formatSessionStartSummary(sessionStartStatus));
   const others = formatOthersLine(extensionsDir);
   if (others) io.stdout(others);
   for (const warning of warnings) {

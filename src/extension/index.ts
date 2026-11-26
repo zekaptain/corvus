@@ -1,16 +1,20 @@
 /**
- * omp capture extension for corvus (backed by agent-memory's `mem records`).
+ * omp capture and session-start injection extension for corvus
+ * (backed by agent-memory's `mem records` and `mem bridge`).
  *
  * Loaded once by omp; omp invokes the default export once per session (main and each
  * spawned subagent) inside the same process. All sessions share one mapper (state keyed
- * by session id) and one `mem records` child process.
+ * by session id), one `mem records` child process, and one lazily spawned `mem bridge`.
  */
 
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { BridgeClient } from "./bridge.ts";
 import { OmpMapper } from "./mapper.ts";
 import type { OmpContext, OmpHookPayload } from "./mapper.ts";
+import { DEFAULT_SESSION_START_CONFIG, SessionStartInjector } from "./session-start.ts";
+import type { SessionStartConfig } from "./session-start.ts";
 import { RecordSink } from "./sink.ts";
 import type { FailureReporter, SinkConfig } from "./sink.ts";
 
@@ -43,11 +47,23 @@ interface StoredConfig {
   home?: unknown;
   port?: unknown;
   spool_only?: unknown;
+  spoolOnly?: unknown;
+  sessionStartInjection?: unknown;
+  sessionStartMaxChars?: unknown;
+  sessionStartMaxItems?: unknown;
+  sessionStartTimeoutMs?: unknown;
+}
+
+export interface ExtensionConfig extends SinkConfig {
+  sessionStartInjection?: boolean;
+  sessionStartMaxChars?: number;
+  sessionStartMaxItems?: number;
+  sessionStartTimeoutMs?: number;
 }
 
 export interface ExtensionOptions {
   configPath?: string;
-  config?: SinkConfig;
+  config?: ExtensionConfig;
   report?: FailureReporter;
   clock?: () => string;
 }
@@ -56,7 +72,7 @@ function defaultConfigPath(): string {
   return join(dirname(fileURLToPath(import.meta.url)), "config.json");
 }
 
-function envSinkConfig(): SinkConfig {
+function envExtensionConfig(): ExtensionConfig {
   const portRaw = process.env.AGENT_MEMORY_PORT;
   const portParsed = portRaw ? Number(portRaw) : undefined;
   return {
@@ -67,16 +83,27 @@ function envSinkConfig(): SinkConfig {
         ? portParsed
         : undefined,
     spoolOnly: process.env.AGENT_MEMORY_SPOOL_ONLY === "1",
+    sessionStartInjection: DEFAULT_SESSION_START_CONFIG.enabled,
+    sessionStartMaxChars: DEFAULT_SESSION_START_CONFIG.maxChars,
+    sessionStartMaxItems: DEFAULT_SESSION_START_CONFIG.maxItems,
+    sessionStartTimeoutMs: DEFAULT_SESSION_START_CONFIG.timeoutMs,
   };
 }
 
-export function loadSinkConfig(configPath: string): { config?: SinkConfig; error?: string } {
+function positiveIntOrDefault(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : fallback;
+}
+
+export function loadExtensionConfig(configPath: string): {
+  config?: ExtensionConfig;
+  error?: string;
+} {
   let raw: string;
   try {
     raw = readFileSync(configPath, "utf8");
   } catch (err) {
     if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
-      return { config: envSinkConfig() };
+      return { config: envExtensionConfig() };
     }
     return { error: `could not read ${configPath} (${err instanceof Error ? err.message : err})` };
   }
@@ -106,9 +133,29 @@ export function loadSinkConfig(configPath: string): { config?: SinkConfig; error
       mem,
       home,
       port,
-      spoolOnly: stored.spool_only === true,
+      spoolOnly: stored.spool_only === true || stored.spoolOnly === true,
+      sessionStartInjection:
+        typeof stored.sessionStartInjection === "boolean"
+          ? stored.sessionStartInjection
+          : DEFAULT_SESSION_START_CONFIG.enabled,
+      sessionStartMaxChars: positiveIntOrDefault(
+        stored.sessionStartMaxChars,
+        DEFAULT_SESSION_START_CONFIG.maxChars,
+      ),
+      sessionStartMaxItems: positiveIntOrDefault(
+        stored.sessionStartMaxItems,
+        DEFAULT_SESSION_START_CONFIG.maxItems,
+      ),
+      sessionStartTimeoutMs: positiveIntOrDefault(
+        stored.sessionStartTimeoutMs,
+        DEFAULT_SESSION_START_CONFIG.timeoutMs,
+      ),
     },
   };
+}
+
+export function loadSinkConfig(configPath: string): { config?: SinkConfig; error?: string } {
+  return loadExtensionConfig(configPath);
 }
 
 export interface CaptureRuntime {
@@ -116,6 +163,25 @@ export interface CaptureRuntime {
   closeNow: () => void;
   readonly mapper: OmpMapper;
   readonly sink: RecordSink | null;
+  readonly bridge: BridgeClient | null;
+}
+
+function toSessionStartConfig(config: ExtensionConfig): SessionStartConfig {
+  return {
+    enabled: config.sessionStartInjection ?? DEFAULT_SESSION_START_CONFIG.enabled,
+    maxChars: positiveIntOrDefault(
+      config.sessionStartMaxChars,
+      DEFAULT_SESSION_START_CONFIG.maxChars,
+    ),
+    maxItems: positiveIntOrDefault(
+      config.sessionStartMaxItems,
+      DEFAULT_SESSION_START_CONFIG.maxItems,
+    ),
+    timeoutMs: positiveIntOrDefault(
+      config.sessionStartTimeoutMs,
+      DEFAULT_SESSION_START_CONFIG.timeoutMs,
+    ),
+  };
 }
 
 export function createRuntime(
@@ -149,16 +215,35 @@ export function createRuntime(
     }
   };
 
-  let sink: RecordSink | null = null;
+  let resolvedConfig: ExtensionConfig | undefined;
   if (options.config) {
-    sink = new RecordSink(options.config, report);
+    resolvedConfig = options.config;
   } else {
-    const loaded = loadSinkConfig(options.configPath ?? defaultConfigPath());
+    const loaded = loadExtensionConfig(options.configPath ?? defaultConfigPath());
     if (loaded.config) {
-      sink = new RecordSink(loaded.config, report);
+      resolvedConfig = loaded.config;
     } else if (loaded.error) {
       report(`corvus: capture disabled; ${loaded.error}`);
     }
+  }
+
+  let sink: RecordSink | null = null;
+  let bridge: BridgeClient | null = null;
+  let injector: SessionStartInjector | null = null;
+
+  if (resolvedConfig) {
+    sink = new RecordSink(resolvedConfig, report);
+    const sessionStartCfg = toSessionStartConfig(resolvedConfig);
+    bridge = new BridgeClient(
+      {
+        mem: resolvedConfig.mem,
+        home: resolvedConfig.home,
+        port: resolvedConfig.port,
+        defaultTimeoutMs: sessionStartCfg.timeoutMs,
+      },
+      report,
+    );
+    injector = new SessionStartInjector(bridge, sessionStartCfg, report);
   }
 
   const mapper = new OmpMapper({
@@ -171,20 +256,31 @@ export function createRuntime(
 
   const onBeforeExit = () => {
     sink?.closeNow();
+    bridge?.close();
   };
   process.once("beforeExit", onBeforeExit);
 
   return {
     mapper,
     sink,
+    bridge,
     closeNow: () => {
       process.off("beforeExit", onBeforeExit);
       sink?.closeNow();
+      bridge?.close();
     },
     attach(pi: OmpExtensionAPI): void {
       const instanceId = nextInstanceId++;
       activeInstances += 1;
       let instanceClosed = false;
+
+      pi.on("before_agent_start", async (_payload, ctx) => {
+        lastCtx = ctx;
+        if (!injector) {
+          return undefined;
+        }
+        return injector.handleBeforeAgentStart(ctx);
+      });
 
       for (const eventName of HOOK_EVENTS) {
         pi.on(eventName, (payload, ctx) => {
@@ -207,6 +303,7 @@ export function createRuntime(
             activeInstances = Math.max(0, activeInstances - 1);
             if (activeInstances === 0) {
               sink?.scheduleClose();
+              bridge?.close();
             }
           }
           // Return undefined so omp never treats this handler as blocking or mutating.

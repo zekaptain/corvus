@@ -100,6 +100,10 @@ describe("corvus installer CLI", () => {
     assert.equal(cfg.home, homeDir);
     assert.equal(cfg.port, 9555);
     assert.equal(cfg.spool_only, false);
+    assert.equal(cfg.sessionStartInjection, false);
+    assert.equal(cfg.sessionStartMaxChars, 2400);
+    assert.equal(cfg.sessionStartMaxItems, 12);
+    assert.equal(cfg.sessionStartTimeoutMs, 1500);
 
     const manifest = JSON.parse(readFileSync(join(target, MANIFEST_FILE_NAME), "utf8")) as {
       managed_by: string;
@@ -108,11 +112,18 @@ describe("corvus installer CLI", () => {
     };
     assert.equal(manifest.managed_by, OWNER_MARKER);
     assert.equal(manifest.version, CORVUS_VERSION);
-    for (const file of ["index.ts", "mapper.ts", "sink.ts", CONFIG_FILE_NAME]) {
+    for (const file of [
+      "index.ts",
+      "mapper.ts",
+      "sink.ts",
+      "bridge.ts",
+      "session-start.ts",
+      CONFIG_FILE_NAME,
+    ]) {
       assert.equal(manifest.files[file], sha256Hex(readFileSync(join(target, file))));
     }
 
-    // Status exits 0 and shows every payload file installed
+    // Status exits 0 and shows every payload file installed plus disabled injection state
     const st1 = cli([
       "status",
       "--dir",
@@ -125,9 +136,39 @@ describe("corvus installer CLI", () => {
       "9555",
     ]);
     assert.equal(st1.code, 0, st1.stdout);
-    for (const file of ["index.ts", "mapper.ts", "sink.ts", CONFIG_FILE_NAME]) {
+    for (const file of [
+      "index.ts",
+      "mapper.ts",
+      "sink.ts",
+      "bridge.ts",
+      "session-start.ts",
+      CONFIG_FILE_NAME,
+    ]) {
       assert.match(st1.stdout, new RegExp(`${file}\\s+installed`));
     }
+    assert.match(
+      st1.stdout,
+      /sessionStartInjection: disabled \(maxChars=2400, maxItems=12, timeoutMs=1500\)/,
+    );
+
+    const stJson0 = cli(["status", "--dir", extDir, "--json"]);
+    assert.equal(stJson0.code, 0);
+    const parsedJson0 = JSON.parse(stJson0.stdout) as {
+      sessionStartInjection: boolean | null;
+      sessionStart: {
+        enabled: boolean;
+        maxChars: number;
+        maxItems: number;
+        timeoutMs: number;
+      } | null;
+    };
+    assert.equal(parsedJson0.sessionStartInjection, false);
+    assert.deepEqual(parsedJson0.sessionStart, {
+      enabled: false,
+      maxChars: 2400,
+      maxItems: 12,
+      timeoutMs: 1500,
+    });
 
     // Idempotent reinstall leaves file inodes unchanged
     const inodesBefore = Object.fromEntries(
@@ -425,6 +466,100 @@ describe("corvus installer CLI", () => {
     ]);
     assert.equal(badPortRes.code, 1);
     assert.match(badPortRes.stderr, /invalid --port/);
+
+    // Validate session-start CLI flags and --no-session-start-injection toggling
+    assert.equal(
+      cli([
+        "install",
+        "--dir",
+        extDir,
+        "--mem",
+        memBin,
+        "--home",
+        homeDir,
+        "--session-start-max-chars",
+        "0",
+      ]).code,
+      1,
+    );
+    assert.equal(
+      cli([
+        "install",
+        "--dir",
+        extDir,
+        "--mem",
+        memBin,
+        "--home",
+        homeDir,
+        "--session-start-max-items",
+        "-2",
+      ]).code,
+      1,
+    );
+    assert.equal(
+      cli([
+        "install",
+        "--dir",
+        extDir,
+        "--mem",
+        memBin,
+        "--home",
+        homeDir,
+        "--session-start-timeout-ms=abc",
+      ]).code,
+      1,
+    );
+    assert.equal(cli(["uninstall", "--dir", extDir, "--session-start-injection"]).code, 1);
+
+    const optIn = cli([
+      "install",
+      "--dir",
+      extDir,
+      "--mem",
+      memBin,
+      "--home",
+      homeDir,
+      "--session-start-injection",
+      "--session-start-max-chars",
+      "1200",
+      "--session-start-max-items",
+      "6",
+      "--session-start-timeout-ms",
+      "800",
+    ]);
+    assert.equal(optIn.code, 0, optIn.stderr);
+    const stOptInText = cli(["status", "--dir", extDir]);
+    assert.equal(stOptInText.code, 0);
+    assert.match(
+      stOptInText.stdout,
+      /sessionStartInjection: enabled \(maxChars=1200, maxItems=6, timeoutMs=800\)/,
+    );
+    const stOptInJson = cli(["status", "--dir", extDir, "--json"]);
+    assert.equal(stOptInJson.code, 0);
+    assert.deepEqual(JSON.parse(stOptInJson.stdout).sessionStart, {
+      enabled: true,
+      maxChars: 1200,
+      maxItems: 6,
+      timeoutMs: 800,
+    });
+    assert.equal(cli(["status", "--dir", extDir, "--no-session-start-injection"]).code, 1);
+
+    const optOut = cli([
+      "install",
+      "--dir",
+      extDir,
+      "--mem",
+      memBin,
+      "--home",
+      homeDir,
+      "--no-session-start-injection",
+    ]);
+    assert.equal(optOut.code, 0, optOut.stderr);
+    assert.equal(
+      JSON.parse(cli(["status", "--dir", extDir, "--json"]).stdout).sessionStartInjection,
+      false,
+    );
+    assert.equal(cli(["uninstall", "--dir", extDir]).code, 0);
 
     // Drive the actual CLI script in a subprocess against a temp dir and capture records.
     const capturedPath = join(rootDir, "captured.jsonl");
