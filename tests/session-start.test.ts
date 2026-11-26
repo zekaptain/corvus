@@ -424,6 +424,38 @@ if (!res.ok) process.exit(2);
     assert.equal(proc.exitCode, 0, proc.stderr.toString());
     assert.ok(elapsed < 2000, `expected prompt exit with unref'd bridge, took ${elapsed}ms`);
   });
+
+  it("keeps the event loop alive while a request timer is active so beforeExit does not fire mid-call", () => {
+    const { memBin } = writeFakeMem({ dir: tmpDir, mode: "ok", delayMs: 80 });
+    const bridgePath = resolve(import.meta.dir, "../src/extension/bridge.ts");
+    const runner = join(tmpDir, "ref-timer-bridge.ts");
+    writeFileSync(
+      runner,
+      `import { BridgeClient } from ${JSON.stringify(bridgePath)};
+const client = new BridgeClient({ mem: ${JSON.stringify(memBin)}, defaultTimeoutMs: 1000 }, () => {});
+let closedEarly = false;
+process.once("beforeExit", () => {
+  closedEarly = true;
+  client.close();
+});
+const res = await client.call("session_context", { harnessSessionId: "sid-ref-timer", cwd: "/tmp/p" });
+if (!res.ok || closedEarly) {
+  console.error("unexpected failure", { res, closedEarly });
+  process.exit(2);
+}
+// No client.close() here; idle process should still exit promptly once call settles and timer clears.
+`,
+    );
+
+    const t0 = Date.now();
+    const proc = Bun.spawnSync([process.execPath, runner], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const elapsed = Date.now() - t0;
+    assert.equal(proc.exitCode, 0, proc.stderr.toString());
+    assert.ok(elapsed >= 60 && elapsed < 2000, `unexpected duration ${elapsed}ms`);
+  });
 });
 
 describe("Session-start injection via before_agent_start (MEM-39)", () => {
