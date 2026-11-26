@@ -192,7 +192,6 @@ export class BridgeClient {
           });
           this.killWedgedChild(detail, "timeout");
         }, timeoutMs);
-        entry.timer.unref?.();
       }
 
       if (options.signal) {
